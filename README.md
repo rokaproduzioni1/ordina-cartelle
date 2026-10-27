@@ -4,6 +4,11 @@ App per macOS (SwiftUI) che ordina i file di una cartella in sottocartelle per d
 (di default `Anno/Mese/Tipo`). Anteprima prima di spostare, annullamento dell'ultima operazione,
 struttura e regole configurabili dalle Impostazioni.
 
+Due sezioni: **Metti in ordine** (riordina una cartella) e **Cerca file** (per nome, data, tipo o una
+combinazione; legge ogni cartella, quindi trova anche i file su dischi esterni e di rete; anteprima
+con la barra spaziatrice; copia o sposta i risultati). La mascotte Genuzzu spiega come usarle.
+Richiede macOS 14; su macOS 26 usa il Liquid Glass.
+
 ## Compilare
 Servono i Command Line Tools di Xcode.
 

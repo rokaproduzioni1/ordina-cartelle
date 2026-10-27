@@ -1,6 +1,8 @@
 import SwiftUI
 import ImageIO
 import AppKit
+import UniformTypeIdentifiers
+import QuickLookUI
 
 // MARK: - Modello
 
@@ -598,6 +600,7 @@ struct ContentView: View {
     @State private var confirm = false
     @State private var dropTargeted = false
     @State private var section = 0
+    @AppStorage("mascotVisible") private var mascotVisible = true
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @StateObject private var search = SearchModel()
 
@@ -608,17 +611,23 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 Picker("Sezione", selection: $section) {
-                    Text("Ordina").tag(0)
+                    Text("Metti in ordine").tag(0)
                     Text("Cerca file").tag(1)
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 240)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 300)
                 .padding([.top, .horizontal])
+                if section == 0 && mascotVisible && vm.phase == .idle && !vm.busy {
+                    GenuzzuTitleBar(title: "Questa è la sezione Metti in ordine", text: "Trascina qui una cartella o sceglila: ti mostro in anteprima come la dispongo in sottocartelle per data e tipo, e non tocco nulla finché non confermi.")
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
                 if section == 0 { sortView } else { SearchView(m: search) { url in
                     vm.setFolder(url)
                     section = 0
                 } }
                 GenuzzuFooter(context: mascotContext)
             }
+            .background(AmbientBackground())
+            .animation(.easeInOut(duration: 0.25), value: vm.phase == .idle)
             .task { if autoUpdateCheck { await Updater.check(silent: true) } }
         }
         // L'elenco cartelle serve solo a scegliere cosa riordinare: nella ricerca si nasconde.
@@ -695,7 +704,7 @@ struct ContentView: View {
                 Button("Annulla ultimo ordinamento") { vm.undo() }
                     .disabled(!vm.canUndo || vm.busy)
                 Button("Ordina") { confirm = true }
-                    .buttonStyle(.borderedProminent)
+                    .prominentGlass()
                     .disabled(vm.moves.isEmpty || vm.busy)
             }
         }
@@ -729,7 +738,6 @@ enum SearchDateField: String, CaseIterable, Identifiable {
     case modified, created
     var id: String { rawValue }
     var title: String { self == .modified ? "modificati" : "creati" }
-    var key: String { self == .modified ? NSMetadataItemFSContentChangeDateKey : NSMetadataItemFSCreationDateKey }
 }
 
 enum DatePreset: String, CaseIterable, Identifiable {
@@ -746,7 +754,7 @@ enum DatePreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// Filtro generico per tipo di file, basato sui tipi di contenuto di Spotlight.
+/// Filtro generico per tipo di file, basato sui tipi di contenuto del sistema.
 enum FileKind: String, CaseIterable, Identifiable {
     case all, images, video, audio, documents, archives
     var id: String { rawValue }
@@ -781,20 +789,40 @@ enum FileKind: String, CaseIterable, Identifiable {
         case .archives: return ["public.archive", "public.disk-image"]
         }
     }
-    var predicate: NSPredicate? {
-        let parts = types.map { NSPredicate(format: "%K == %@", NSMetadataItemContentTypeTreeKey, $0) }
-        switch parts.count {
-        case 0: return nil
-        case 1: return parts[0]   // NSMetadataQuery rifiuta predicati composti da un solo elemento
-        default: return NSCompoundPredicate(orPredicateWithSubpredicates: parts)
-        }
+    /// Tipi di contenuto che corrispondono a questa categoria.
+    var utTypes: [UTType] { types.compactMap { UTType($0) } }
+}
+
+/// Anteprima rapida di sistema (quella del Finder con la barra spaziatrice).
+final class QuickLook: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    static let shared = QuickLook()
+    private var urls: [URL] = []
+
+    func toggle(_ urls: [URL], index: Int) {
+        guard let panel = QLPreviewPanel.shared(), !urls.isEmpty else { return }
+        if panel.isVisible { panel.orderOut(nil); return }
+        self.urls = urls
+        panel.dataSource = self
+        panel.delegate = self
+        panel.reloadData()
+        panel.currentPreviewItemIndex = min(max(index, 0), urls.count - 1)
+        panel.makeKeyAndOrderFront(nil)
     }
+
+    /// Se l'anteprima è aperta, mostra un altro file (cambiando la selezione nell'elenco).
+    func follow(_ index: Int) {
+        guard let panel = QLPreviewPanel.shared(), panel.isVisible, index >= 0, index < urls.count else { return }
+        panel.currentPreviewItemIndex = index
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { urls.count }
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! { urls[index] as NSURL }
 }
 
 @MainActor
 final class SearchModel: ObservableObject {
     /// Criteri di ricerca: ognuno si accende da solo e, se ce n'è più di uno, valgono tutti insieme.
-    @Published var useName = true
+    @Published var useName = false
     @Published var text = ""
     @Published var useDate = false
     @Published var useKind = false
@@ -808,7 +836,10 @@ final class SearchModel: ObservableObject {
     @Published var includeSystem = false
     @Published var destination: URL?
     /// La destinazione è facoltativa: finché è spenta l'app si limita a cercare.
-    @Published var useDestination = false
+    @Published var useDestination = false {
+        // Con la destinazione i file si scelgono per spostarli: di partenza sono tutti scelti.
+        didSet { if useDestination && selection.isEmpty { selection = Set(hits.map(\.id)) } }
+    }
     /// Cartella in cui cercare; nil = tutto il computer.
     @Published var scope: URL?
     @Published var busy = false
@@ -816,9 +847,41 @@ final class SearchModel: ObservableObject {
     @Published var offerSort: URL?
     @Published var status = "Scrivi una parte del nome dei file e premi Invio."
     @Published var lastMoved: [(from: URL, to: URL)] = []
-    private var query: NSMetadataQuery?
-    private var observer: NSObjectProtocol?
+    /// Dischi esterni e di rete collegati in questo momento.
+    @Published var volumes: [Volume] = []
+    @Published var scanned = 0
+    private var deepTask: Task<Void, Never>?
     private static let maxHits = 5000
+
+    struct Volume: Identifiable {
+        let url: URL
+        let name: String
+        let network: Bool
+        var id: String { url.path }
+    }
+
+    init() {
+        refreshVolumes()
+        for n in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.refreshVolumes() }
+            }
+        }
+    }
+
+    func refreshVolumes() {
+        let keys: [URLResourceKey] = [.volumeNameKey, .volumeIsLocalKey, .volumeIsInternalKey, .volumeIsRootFileSystemKey]
+        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
+        volumes = urls.compactMap { u in
+            guard let v = try? u.resourceValues(forKeys: Set(keys)), v.volumeIsRootFileSystem != true else { return nil }
+            let network = v.volumeIsLocal == false
+            guard network || v.volumeIsInternal == false else { return nil }
+            return Volume(url: u, name: v.volumeName ?? u.lastPathComponent, network: network)
+        }
+    }
+
+    /// Sceglie dove cercare; nil = tutto il computer.
+    func selectScope(_ url: URL?) { scope = url?.standardizedFileURL }
 
     /// Esclude Libreria, pacchetti .app e cartelle nascoste, a meno che si chieda di includerli.
     var hits: [Hit] {
@@ -841,63 +904,95 @@ final class SearchModel: ObservableObject {
             status = "Scrivi almeno due caratteri."
             return
         }
-        query?.stop()
-        if let o = observer { NotificationCenter.default.removeObserver(o) }
+        deepTask?.cancel()
         all = []
         selection = []
         searching = true
+        scanned = 0
         status = "Ricerca in corso…"
-
-        let q = NSMetadataQuery()
-        var parts = words.map { NSPredicate(format: "%K CONTAINS[cd] %@", NSMetadataItemFSNameKey, $0) }
-        if useDate {
-            // Dal primo istante del giorno "dal" fino alla fine del giorno "al" (le due date si possono invertire).
-            let cal = Calendar.current
-            let lo = cal.startOfDay(for: min(from, to))
-            let hi = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: max(from, to))) ?? max(from, to)
-            parts.append(NSPredicate(format: "%K >= %@ AND %K < %@", dateField.key, lo as NSDate, dateField.key, hi as NSDate))
-        }
-        if useKind, let k = kind.predicate { parts.append(k) }
-        // NSMetadataQuery lancia un'eccezione con un predicato composto da un solo elemento.
-        q.predicate = parts.count == 1 ? parts[0] : NSCompoundPredicate(andPredicateWithSubpredicates: parts)
-        q.searchScopes = [scope?.path ?? NSMetadataQueryLocalComputerScope]
-        observer = NotificationCenter.default.addObserver(
-            forName: .NSMetadataQueryDidFinishGathering, object: q, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.finish() }
-        }
-        query = q
-        q.start()
+        searchDeep(words: words)
     }
 
-    private func finish() {
-        guard let q = query else { return }
-        q.disableUpdates()
-        var found: [Hit] = []
-        for case let item as NSMetadataItem in q.results {
-            guard let path = item.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
-            let tree = item.value(forAttribute: NSMetadataItemContentTypeTreeKey) as? [String] ?? []
-            if tree.contains("public.folder") { continue }
-            found.append(Hit(url: URL(fileURLWithPath: path),
-                             size: (item.value(forAttribute: NSMetadataItemFSSizeKey) as? NSNumber)?.int64Value,
-                             date: item.value(forAttribute: useDate ? dateField.key : NSMetadataItemFSContentChangeDateKey) as? Date))
+    /// Interrompe la ricerca in corso e tiene i risultati già trovati.
+    func stop() { deepTask?.cancel() }
+
+    private func searchDeep(words: [String]) {
+        let roots = scope.map { [$0] } ?? ([FileManager.default.homeDirectoryForCurrentUser] + volumes.map(\.url))
+        let cal = Calendar.current
+        let lo = cal.startOfDay(for: min(from, to))
+        let hi = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: max(from, to))) ?? max(from, to)
+        let dateRange = useDate ? (created: dateField == .created, lo: lo, hi: hi) : nil
+        let types = useKind ? kind.utTypes : []
+        let skipLibrary = !includeSystem && scope == nil
+        deepTask = Task.detached(priority: .userInitiated) { [weak self] in
+            var batch: [Hit] = []
+            var count = 0
+            var lastReport = Date()
+            let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
+                                          .creationDateKey, .contentTypeKey]
+            func flush(_ folder: String) async {
+                let out = batch, n = count
+                batch = []
+                lastReport = Date()
+                await MainActor.run { self?.deepProgress(out, scanned: n, folder: folder) }
+            }
+            outer: for root in roots {
+                guard let en = FileManager.default.enumerator(
+                    at: root, includingPropertiesForKeys: keys,
+                    options: [.skipsHiddenFiles, .skipsPackageDescendants],
+                    errorHandler: { _, _ in true }) else { continue }
+                while let url = en.nextObject() as? URL {
+                    if Task.isCancelled { break outer }
+                    let v = try? url.resourceValues(forKeys: Set(keys))
+                    if v?.isDirectory == true {
+                        if skipLibrary && url.lastPathComponent == "Library" { en.skipDescendants() }
+                        continue
+                    }
+                    count += 1
+                    var date = v?.contentModificationDate
+                    if !words.allSatisfy({ url.lastPathComponent.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) != nil }) {
+                        // Nome non corrispondente
+                    } else if let d = dateRange, !({
+                        date = d.created ? v?.creationDate : v?.contentModificationDate
+                        guard let x = date else { return false }
+                        return x >= d.lo && x < d.hi
+                    }()) {
+                        // Data fuori dal periodo
+                    } else if !types.isEmpty, !(v?.contentType.map { t in types.contains { t.conforms(to: $0) } } ?? false) {
+                        // Tipo diverso
+                    } else {
+                        batch.append(Hit(url: url, size: v?.fileSize.map(Int64.init), date: date))
+                    }
+                    if batch.count >= 200 || Date().timeIntervalSince(lastReport) > 0.4 {
+                        await flush(url.deletingLastPathComponent().lastPathComponent)
+                    }
+                }
+            }
+            await flush("")
+            await MainActor.run { self?.deepFinish() }
         }
-        q.stop()
-        found.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        all = Array(found.prefix(Self.maxHits))
-        selection = Set(hits.map(\.id))
+    }
+
+    private func deepProgress(_ hits: [Hit], scanned n: Int, folder: String) {
+        guard searching else { return }
+        all.append(contentsOf: hits.prefix(max(Self.maxHits - all.count, 0)))
+        scanned = n
+        status = "Ricerca approfondita: \(n) file controllati, \(all.count) trovati" + (folder.isEmpty ? "" : " · ora in “\(folder)”")
+    }
+
+    private func deepFinish() {
+        guard searching else { return }
+        all.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        selection = useDestination ? Set(hits.map(\.id)) : []
         searching = false
         let n = hits.count
-        status = n == 0 ? "Nessun file trovato."
-            : "\(n) file trovati" + (found.count > Self.maxHits ? " (mostrati i primi \(Self.maxHits): restringi la ricerca)." : ".")
+        status = n == 0 ? "Nessun file trovato (controllati \(scanned))." : "\(n) file trovati su \(scanned) controllati."
     }
 
-    /// Svuota testo e risultati (interrompendo una ricerca in corso); cartella di ricerca e destinazione restano.
     func clear() {
-        query?.stop()
-        if let o = observer { NotificationCenter.default.removeObserver(o); observer = nil }
-        query = nil
+        deepTask?.cancel()
         text = ""
-        useName = true
+        useName = false
         useDate = false
         useKind = false
         kind = .images
@@ -914,13 +1009,17 @@ final class SearchModel: ObservableObject {
     }
 
     /// Riassunto a parole di cosa verrà cercato, mostrato sotto il pulsante Cerca.
-    var summary: String {
-        guard canSearch else { return "Scegli almeno un criterio di ricerca, poi premi Cerca." }
+    /// I criteri attivi in una riga, per esempio “nome con “cliente” · tipo: immagini”.
+    var criteriaBits: String {
         var bits: [String] = []
         if useName, !text.trimmingCharacters(in: .whitespaces).isEmpty { bits.append("nome con “\(text.trimmingCharacters(in: .whitespaces))”") }
         if useDate { bits.append("\(dateField.title) \(rangeDescription)") }
         if useKind { bits.append("tipo: \(kind.title.lowercased())") }
-        return "Cercherò file con " + bits.joined(separator: " · ") + " — in " + (scope?.lastPathComponent ?? "tutto il computer")
+        return bits.joined(separator: " · ")
+    }
+    var summary: String {
+        guard canSearch else { return "Scegli almeno un criterio di ricerca, poi premi Cerca." }
+        return "Cercherò file con " + criteriaBits + " — in " + (scope?.lastPathComponent ?? "tutto il computer")
     }
 
     /// Imposta il periodo e attiva il filtro per data.
@@ -952,7 +1051,7 @@ final class SearchModel: ObservableObject {
         p.canChooseFiles = false
         p.prompt = "Cerca qui"
         p.message = "Scegli la cartella in cui cercare"
-        if p.runModal() == .OK, let url = p.url { scope = url.standardizedFileURL }
+        if p.runModal() == .OK, let url = p.url { selectScope(url) }
     }
 
     func chooseDestination() {
@@ -1025,6 +1124,20 @@ final class SearchModel: ObservableObject {
 }
 
 /// Scheda che identifica una cartella con il suo ruolo (origine o destinazione).
+/// Pulsante a tutta larghezza per i comandi di una posizione (Scegli cartella…, Cambia…, Rimuovi).
+struct PlaceButtonStyle: ButtonStyle {
+    let color: Color
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .medium))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(color.opacity(configuration.isPressed ? 0.3 : 0.16)))
+            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
 struct PlaceCard<Actions: View>: View {
     let role: String
     let symbol: String
@@ -1047,15 +1160,18 @@ struct PlaceCard<Actions: View>: View {
                     .font(.callout.weight(path == nil ? .regular : .semibold))
                     .foregroundStyle(path == nil ? (missing ? Color.orange : .secondary) : .primary)
                     .lineLimit(1).truncationMode(.middle)
-                HStack(spacing: 8) { actions }.font(.caption)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 8)
+            // I comandi stanno a destra, in colonna e tutti della stessa larghezza.
+            VStack(spacing: 6) { actions }
+                .buttonStyle(PlaceButtonStyle(color: color))
+                .frame(width: 128)
         }
-        .padding(10)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 12).fill(color.opacity(0.08)))
+        .glass(RoundedRectangle(cornerRadius: 14, style: .continuous), tint: color.opacity(0.28))
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(missing ? Color.orange : color.opacity(0.45),
                               style: StrokeStyle(lineWidth: missing ? 1.5 : 1, dash: missing ? [5, 4] : []))
         )
@@ -1101,7 +1217,7 @@ struct RangeCalendarView: View {
             HStack {
                 Button { shift(-1) } label: { Image(systemName: "chevron.left") }
                 Spacer()
-                Text(month.formatted(.dateTime.month(.wide).year()).capitalized).font(.headline)
+                Text(month.formatted(.dateTime.month(.wide).year()).capitalized).font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Button { shift(1) } label: { Image(systemName: "chevron.right") }
             }
@@ -1112,7 +1228,7 @@ struct RangeCalendarView: View {
                     Text(d).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).frame(maxWidth: .infinity)
                 }
             }
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7), spacing: 2) {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7), spacing: 3) {
                 ForEach(cells) { c in
                     if let d = c.date {
                         let day = cal.startOfDay(for: d)
@@ -1122,11 +1238,21 @@ struct RangeCalendarView: View {
                             Text("\(cal.component(.day, from: d))")
                                 .font(.callout.weight(isEnd ? .bold : .regular).monospacedDigit())
                                 .foregroundStyle(isEnd ? Color.white : .primary)
-                                .frame(maxWidth: .infinity, minHeight: 26)
+                                .frame(maxWidth: .infinity, minHeight: 30)
                                 .background {
                                     ZStack {
-                                        if inRange { Rectangle().fill(Color.accentColor.opacity(0.2)) }
-                                        if isEnd { Circle().fill(Color.accentColor) }
+                                        if inRange {
+                                            // Fascia del periodo: arrotondata a inizio, fine e a capo riga.
+                                            let col = (cal.component(.weekday, from: d) - cal.firstWeekday + 7) % 7
+                                            let capL = day == lo || col == 0 || cal.component(.day, from: d) == 1
+                                            let capR = day == hi || col == 6
+                                                || cal.date(byAdding: .day, value: 1, to: d).map { !cal.isDate($0, equalTo: d, toGranularity: .month) } == true
+                                            UnevenRoundedRectangle(topLeadingRadius: capL ? 15 : 0, bottomLeadingRadius: capL ? 15 : 0,
+                                                                   bottomTrailingRadius: capR ? 15 : 0, topTrailingRadius: capR ? 15 : 0,
+                                                                   style: .continuous)
+                                                .fill(Color.accentColor.opacity(0.2))
+                                        }
+                                        if isEnd { Circle().fill(Color.accentColor).frame(width: 30, height: 30) }
                                     }
                                 }
                                 .overlay {
@@ -1138,7 +1264,7 @@ struct RangeCalendarView: View {
                         }
                         .buttonStyle(.plain)
                     } else {
-                        Color.clear.frame(height: 26)
+                        Color.clear.frame(height: 30)
                     }
                 }
             }
@@ -1153,6 +1279,10 @@ struct SearchView: View {
     /// Chiamata quando l'utente accetta di riordinare la cartella di destinazione.
     var onSort: (URL) -> Void
     @State private var confirmMove = false
+    /// Dopo una ricerca si vede solo l'elenco dei risultati; con "Modifica ricerca" tornano i comandi.
+    @State private var editing = false
+    @FocusState private var listFocused: Bool
+    @AppStorage("mascotVisible") private var mascotVisible = true
 
     // Soglie di larghezza (area utile della vista) oltre le quali si passa dal layout stretto a quello largo.
     private let mediumWidth: CGFloat = 600
@@ -1160,19 +1290,44 @@ struct SearchView: View {
     /// Sopra questa larghezza la ricerca sta a sinistra e animazione/risultati a destra.
     private let twoColumnWidth: CGFloat = 800
 
+    /// Un singolo passo, senza riquadro proprio: i riquadri sono `cardBox`.
     private func stepCard<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) { content() }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    /// Il rettangolo che racchiude uno o più passi.
+    private func cardBox<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 14) { content() }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color.secondary.opacity(0.06)))
+            .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
+
+    /// I tre passi della ricerca (1, 2, 3) nello stesso rettangolo.
+    private func stepsCard(medium: Bool, wide: Bool) -> some View {
+        cardBox {
+            criteriaCard(medium: medium)
+            Divider()
+            if wide {
+                HStack(alignment: .top, spacing: 12) { whereCard; afterCard }
+            } else {
+                whereCard
+                Divider()
+                afterCard
+            }
+        }
+    }
+
+    /// Cerca e Pulisci tutto in un rettangolo a parte.
+    private var actionsCard: some View { cardBox { searchButton } }
 
     private func stepHeader(_ n: Int, _ title: String, _ subtitle: String? = nil) -> some View {
         HStack(spacing: 8) {
             Text("\(n)").font(.caption.weight(.bold)).foregroundStyle(.white)
                 .frame(width: 22, height: 22).background(Circle().fill(Color.accentColor))
-            Text(title).font(.headline)
-            if let subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+            Text(title).font(.system(size: 16, weight: .bold))
+            if let subtitle { Text(subtitle).font(.system(size: 11, weight: .regular)).foregroundStyle(.secondary).lineLimit(1) }
         }
     }
 
@@ -1183,19 +1338,19 @@ struct SearchView: View {
                     .font(.system(size: 18))
                     .foregroundStyle(isOn.wrappedValue ? Color.accentColor : .secondary)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(title).font(.headline)
-                    Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(title).font(.system(size: 14, weight: .semibold))
+                    Text(subtitle).font(.system(size: 11, weight: .regular)).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 10)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(isOn.wrappedValue ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.08)))
-            .overlay(RoundedRectangle(cornerRadius: 10)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(isOn.wrappedValue ? Color.accentColor : Color.secondary.opacity(0.3),
                               lineWidth: isOn.wrappedValue ? 2 : 1))
-            .contentShape(RoundedRectangle(cornerRadius: 10))
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.plain)
     }
@@ -1204,25 +1359,42 @@ struct SearchView: View {
         VStack(alignment: .leading, spacing: 8) { content() }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color(nsColor: .controlBackgroundColor)))
     }
 
-    private var dateOptions: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func dateOptions(centered: Bool) -> some View {
+        let edge: HorizontalAlignment = centered ? .center : .leading
+        let explanation = m.dateField == .modified
+            ? "L'ultima volta che il file è stato cambiato e salvato. Se riapri un vecchio documento e lo salvi oggi, conta come di oggi."
+            : "Il giorno in cui il file è nato sul computer: scaricato, fotografato o salvato per la prima volta. Non cambia se poi lo modifichi."
+        return VStack(alignment: edge, spacing: 10) {
+            Text("Quale data deve contare?").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
             Picker("", selection: $m.dateField) {
-                Text("Modificati").tag(SearchDateField.modified)
-                Text("Creati").tag(SearchDateField.created)
+                Text("Ultima modifica").tag(SearchDateField.modified)
+                Text("Creazione").tag(SearchDateField.created)
             }
-            .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 200)
+            .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 260)
+            Label {
+                Text(explanation)
+                    .font(.system(size: 12, weight: .regular))
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "info.circle.fill").foregroundStyle(Color.accentColor)
+            }
+            .padding(.vertical, 8).padding(.horizontal, 10)
+            .frame(maxWidth: 360, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.accentColor.opacity(0.10)))
             Text("File \(m.dateField.title) \(m.rangeDescription)")
-                .font(.title3.weight(.semibold))
+                .font(.system(size: 15, weight: .semibold))
+                .multilineTextAlignment(centered ? .center : .leading)
                 .fixedSize(horizontal: false, vertical: true)
             Menu("Scorciatoie…") {
                 ForEach(DatePreset.allCases) { p in Button(p.title) { m.select(p) } }
             }
             .fixedSize()
             Text("Clicca due giorni sul calendario per scegliere il periodo.")
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.system(size: 11, weight: .regular)).foregroundStyle(.secondary)
+                .multilineTextAlignment(centered ? .center : .leading)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -1252,12 +1424,15 @@ struct SearchView: View {
                     if medium {
                         HStack(alignment: .top, spacing: 22) {
                             RangeCalendarView(from: $m.from, to: $m.to).frame(width: 240)
-                            dateOptions
+                            dateOptions(centered: false)
                             Spacer(minLength: 0)
                         }
                     } else {
-                        RangeCalendarView(from: $m.from, to: $m.to).frame(maxWidth: 300)
-                        dateOptions
+                        RangeCalendarView(from: $m.from, to: $m.to)
+                            .frame(maxWidth: 320)
+                            .frame(maxWidth: .infinity)
+                        dateOptions(centered: true)
+                            .frame(maxWidth: .infinity)
                     }
                 }
             }
@@ -1289,11 +1464,70 @@ struct SearchView: View {
         stepCard {
             stepHeader(2, "Dove cerchi")
             originCard
+            placeChips
+            modePicker
             Toggle("Includi file di sistema e della Libreria", isOn: $m.includeSystem)
                 .disabled(m.scope != nil)
                 .lineLimit(1)
                 .font(.callout)
         }
+    }
+
+    // MARK: Dove e come cercare
+
+    private func placeChip(_ title: String, _ symbol: String, selected: Bool) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: symbol).font(.system(size: 17))
+                .foregroundStyle(selected ? Color.accentColor : .secondary)
+            Text(title).font(.system(size: 11, weight: selected ? .semibold : .medium))
+                .lineLimit(1).minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, minHeight: 52)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(selected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.25), lineWidth: selected ? 2 : 1))
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    /// Scelte rapide: tutto il Mac, la cartella personale, i dischi esterni e quelli di rete collegati.
+    private var placeChips: some View {
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL
+        let externals = m.volumes.filter { !$0.network }
+        let networks = m.volumes.filter { $0.network }
+        func volumeMenu(_ title: String, _ symbol: String, _ list: [SearchModel.Volume], empty: String) -> some View {
+            Menu {
+                ForEach(list) { v in Button(v.name) { m.selectScope(v.url) } }
+            } label: {
+                placeChip(title, symbol, selected: m.scope.map { s in list.contains { s.path.hasPrefix($0.url.path) } } ?? false)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden)
+            .buttonStyle(.plain)
+            .disabled(list.isEmpty)
+            .opacity(list.isEmpty ? 0.45 : 1)
+            .help(list.isEmpty ? empty : "Scegli il disco in cui cercare")
+        }
+        return LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 8)], spacing: 8) {
+            Button { m.selectScope(nil) } label: { placeChip("Tutto il computer", "desktopcomputer", selected: m.scope == nil) }
+                .buttonStyle(.plain)
+            Button { m.selectScope(home) } label: { placeChip("Cartella personale", "house", selected: m.scope == home) }
+                .buttonStyle(.plain)
+            volumeMenu("Dischi esterni", "externaldrive", externals, empty: "Nessun disco esterno collegato")
+            volumeMenu("Rete", "network", networks, empty: "Nessun disco di rete collegato: collegalo dal Finder con Vai › Connetti al server")
+        }
+    }
+
+    /// La ricerca legge ogni cartella: trova tutto, anche su dischi esterni e di rete, ma richiede un po' di tempo.
+    private var modePicker: some View {
+        Label {
+            Text(m.scope == nil
+                 ? "Cerco nella cartella personale e in tutti i dischi collegati: può richiedere qualche minuto. Puoi interrompere quando vuoi e tieni quello già trovato."
+                 : "Leggo ogni cartella, anche su dischi esterni e di rete: da alcuni secondi a qualche minuto. Puoi interrompere quando vuoi e tieni quello già trovato.")
+                .font(.system(size: 11, weight: .regular)).fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "info.circle").foregroundStyle(.secondary)
+        }
+        .foregroundStyle(.secondary)
     }
 
     /// Passo 3: facoltativo, cosa fare dei file trovati.
@@ -1306,26 +1540,29 @@ struct SearchView: View {
 
     /// Il pulsante principale della sezione: grande, pieno, sempre il più visibile.
     private var searchButton: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let enabled = (m.canSearch || m.searching) && !m.busy
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 12) {
-                Button { m.search() } label: {
+                Button { if m.searching { m.stop() } else { m.search() } } label: {
                     HStack(spacing: 6) {
                         if m.searching { ProgressView().controlSize(.small) }
                         else { Image(systemName: "magnifyingglass") }
-                        Text(m.searching ? "Ricerca…" : "Cerca")
+                        Text(m.searching ? "Interrompi" : "Cerca")
                     }
                     .font(.headline)
+                    .foregroundStyle(enabled ? Color.black : Color.secondary)
                     .frame(minWidth: 110)
                 }
-                .buttonStyle(.borderedProminent)
+                .prominentGlass(tint: .yellow)
                 .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
-                .disabled(!m.canSearch || m.searching || m.busy)
+                .disabled(!enabled)
                 Spacer(minLength: 8)
                 Button { m.clear() } label: { Label("Pulisci tutto", systemImage: "xmark.circle") }
                     .buttonStyle(.borderless).font(.caption)
                     .disabled(m.busy || (m.text.isEmpty && !m.useDate && !m.useKind && m.all.isEmpty && !m.searching))
             }
+            if m.searching { SearchProgressBar().padding(.vertical, 2) }
             Text(m.summary).font(.caption).foregroundStyle(.secondary).lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -1335,7 +1572,7 @@ struct SearchView: View {
         PlaceCard(role: "ORIGINE", symbol: "magnifyingglass", color: .blue,
                   path: m.scope?.path ?? "Tutto il computer", placeholder: "") {
             Button("Scegli cartella…") { m.chooseScope() }
-            if m.scope != nil { Button("Tutto il computer") { m.scope = nil } }
+            if m.scope != nil { Button("Tutto il computer") { m.selectScope(nil) } }
         }
     }
 
@@ -1365,9 +1602,9 @@ struct SearchView: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, minHeight: 68, alignment: .leading)
-            .overlay(RoundedRectangle(cornerRadius: 12)
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(Color.teal.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
-            .contentShape(RoundedRectangle(cornerRadius: 12))
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
     }
@@ -1376,32 +1613,75 @@ struct SearchView: View {
         Group { if m.useDestination { destinationCard } else { addDestinationCard } }
     }
 
+    /// Il nome con le parole cercate evidenziate.
+    private func highlighted(_ name: String) -> AttributedString {
+        var out = AttributedString(name)
+        guard m.useName else { return out }
+        for w in m.text.split(separator: " ").map(String.init) where !w.isEmpty {
+            var from = name.startIndex
+            while let r = name.range(of: w, options: [.caseInsensitive, .diacriticInsensitive], range: from..<name.endIndex) {
+                if let lo = AttributedString.Index(r.lowerBound, within: out), let hi = AttributedString.Index(r.upperBound, within: out) {
+                    out[lo..<hi].backgroundColor = Color.yellow.opacity(0.35)
+                }
+                from = r.upperBound
+            }
+        }
+        return out
+    }
+
+    /// Anteprima di tutti i risultati, partendo dal file selezionato (o dal primo).
+    private func previewIndex() -> Int {
+        m.hits.firstIndex { m.selection.contains($0.id) } ?? 0
+    }
+
+    private func preview() { QuickLook.shared.toggle(m.hits.map(\.url), index: previewIndex()) }
+
     private var resultsList: some View {
         List(m.hits, selection: $m.selection) { h in
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
                 Image(nsImage: NSWorkspace.shared.icon(forFile: h.url.path))
-                    .resizable().frame(width: 28, height: 28)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(h.name).lineLimit(1).truncationMode(.middle)
+                    .resizable().frame(width: 36, height: 36)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(highlighted(h.name))
+                        .font(.system(size: 14, weight: .semibold))
+                        .lineLimit(1).truncationMode(.middle)
                     Text(h.url.deletingLastPathComponent().path
                             .replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.system(size: 11, weight: .regular)).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.head)
                 }
                 Spacer(minLength: 8)
-                VStack(alignment: .trailing, spacing: 1) {
-                    if let s = h.size { Text(ByteCountFormatter.string(fromByteCount: s, countStyle: .file)) }
-                    if let d = h.date { Text(d.formatted(date: .abbreviated, time: .omitted)) }
+                VStack(alignment: .trailing, spacing: 2) {
+                    if let s = h.size {
+                        Text(ByteCountFormatter.string(fromByteCount: s, countStyle: .file))
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    if let d = h.date {
+                        Text(d.formatted(date: .abbreviated, time: .omitted))
+                            .font(.system(size: 11, weight: .regular)).foregroundStyle(.secondary)
+                    }
                 }
-                .font(.caption).foregroundStyle(.secondary)
+                .monospacedDigit()
                 .fixedSize()
             }
+            .padding(.vertical, 4)
             .tag(h.id)
         }
+        .scrollContentBackground(.hidden)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .contextMenu(forSelectionType: String.self) { ids in
+            Button("Anteprima") { preview() }
             Button("Mostra nel Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting(ids.map { URL(fileURLWithPath: $0) })
             }
+        } primaryAction: { _ in preview() }
+        .focused($listFocused)
+        .onAppear { listFocused = true }
+        .onKeyPress(.space) { preview(); return .handled }
+        .onChange(of: m.selection) { _ in
+            listFocused = true   // la barra spaziatrice non deve finire nel campo di testo
+            QuickLook.shared.follow(previewIndex())
         }
         .frame(minHeight: 180, idealHeight: 280, maxHeight: .infinity)
     }
@@ -1423,7 +1703,7 @@ struct SearchView: View {
             Button("Sposta \(m.selectedHits.count) file…") { confirmMove = true }
                 .disabled(m.destination == nil || m.selection.isEmpty || m.busy)
             Button("Copia \(m.selectedHits.count) file") { m.transfer(move: false) }
-                .buttonStyle(.borderedProminent)
+                .prominentGlass()
                 .disabled(m.destination == nil || m.selection.isEmpty || m.busy)
         }
         return Group {
@@ -1443,20 +1723,23 @@ struct SearchView: View {
         VStack(alignment: .leading, spacing: 12) {
             if m.hits.isEmpty {
                 VStack(spacing: 8) {
-                    SearchAnimationView(name: m.useName, date: m.useDate, kind: m.useKind ? m.kind : nil,
-                                        copy: m.useDestination)
-                        .frame(minHeight: 220)
+                    SearchCoachView(name: m.useName, date: m.useDate, kind: m.useKind ? m.kind : nil,
+                                    copy: m.useDestination, sideBySide: medium,
+                                    toggles: [$m.useName, $m.useDate, $m.useKind])
                     Text(m.status).foregroundStyle(.secondary).font(.callout)
                         .multilineTextAlignment(.center)
+                    if m.searching { SearchProgressBar().frame(maxWidth: 280) }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             } else {
                 resultsList
                 HStack {
                     Text(m.useDestination ? "\(m.hits.count) trovati · \(m.selectedHits.count) selezionati"
                                           : "\(m.hits.count) file trovati")
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 13, weight: .semibold))
                     Spacer()
+                    Button { preview() } label: { Label("Anteprima · Spazio", systemImage: "eye") }
+                        .help("Seleziona un file e premi la barra spaziatrice, come nel Finder")
                     if m.useDestination {
                         Button("Seleziona tutto") { m.selection = Set(m.hits.map(\.id)) }
                         Button("Deseleziona") { m.selection = [] }
@@ -1472,37 +1755,58 @@ struct SearchView: View {
         }
     }
 
+    private var resultsOnly: Bool { !m.hits.isEmpty && !editing }
+
+    /// Dopo la ricerca: solo i risultati, con una barra per tornare ai comandi o ricominciare.
+    private var resultsOnlyView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Button { editing = true } label: { Label("Modifica ricerca", systemImage: "slider.horizontal.3") }
+                Text(m.criteriaBits)
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 8)
+                if m.searching {
+                    ProgressView().controlSize(.small)
+                    Button("Interrompi") { m.stop() }
+                }
+                if !m.useDestination {
+                    Button { m.useDestination = true } label: { Label("Copia o sposta…", systemImage: "folder.badge.plus") }
+                }
+                Button { m.clear() } label: { Label("Nuova ricerca", systemImage: "xmark.circle") }
+            }
+            .font(.system(size: 12, weight: .medium))
+            if m.searching {
+                SearchProgressBar()
+                Text(m.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if m.useDestination { destinationCard }
+            resultsArea(medium: true)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .padding()
+    }
+
     /// Finestra stretta: tutto in colonna, comandi sopra e risultati sotto.
     private func stacked(medium: Bool, wide: Bool) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            criteriaCard(medium: medium)
-            if wide {
-                HStack(alignment: .top, spacing: 12) { whereCard; afterCard }
-            } else {
-                whereCard
-                afterCard
-            }
-            searchButton
+            stepsCard(medium: medium, wide: wide)
+            actionsCard
             resultsArea(medium: medium)
         }
     }
 
     /// Finestra larga: comandi a sinistra (con Cerca sempre visibile), animazione o risultati a destra.
     private func twoColumns(width: CGFloat) -> some View {
-        let left = min(max(width * 0.42, 340), 430)
+        let left = min(max(width * 0.52, 440), 600)
         let rightWidth = width - left - 16 - 32
         return HStack(alignment: .top, spacing: 16) {
             VStack(alignment: .leading, spacing: 10) {
                 ScrollView(.vertical) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        criteriaCard(medium: false)
-                        whereCard
-                        afterCard
-                    }
-                    .padding(.trailing, 6)
+                    stepsCard(medium: false, wide: false)
+                        .padding(.trailing, 6)
                 }
-                Divider()
-                searchButton
+                actionsCard
             }
             .frame(width: left)
             resultsArea(medium: rightWidth >= 560)
@@ -1511,19 +1815,36 @@ struct SearchView: View {
         .padding()
     }
 
+    /// Finché non si sceglie nessun criterio, Genuzzu apre la sezione come un titolo.
+    private var welcomeVisible: Bool { mascotVisible && !m.useName && !m.useDate && !m.useKind }
+
+    private var welcomeHeader: some View {
+        GenuzzuTitleBar(title: "Questa è la sezione di ricerca file", text: "Vuoi cercare un file per nome, per data, per tipo? Puoi anche scegliere più filtri contemporaneamente.")
+    }
+
     var body: some View {
         // Se la finestra è bassa il contenuto scorre; se è alta l'elenco dei risultati occupa lo spazio in più.
-        GeometryReader { geo in
-            if geo.size.width >= twoColumnWidth {
-                twoColumns(width: geo.size.width)
+        VStack(spacing: 0) {
+            if welcomeVisible { welcomeHeader.transition(.move(edge: .top).combined(with: .opacity)) }
+            if resultsOnly {
+                resultsOnlyView
             } else {
-                ScrollView(.vertical) {
-                    stacked(medium: geo.size.width >= mediumWidth, wide: geo.size.width >= wideWidth)
-                        .padding()
-                        .frame(minHeight: geo.size.height)
+            GeometryReader { geo in
+                if geo.size.width >= twoColumnWidth {
+                    twoColumns(width: geo.size.width)
+                } else {
+                    ScrollView(.vertical) {
+                        stacked(medium: geo.size.width >= mediumWidth, wide: geo.size.width >= wideWidth)
+                            .padding()
+                            .frame(minHeight: geo.size.height)
+                    }
                 }
             }
+            }
         }
+        .onChange(of: m.searching) { if $0 { editing = false } }
+        .onChange(of: m.hits.isEmpty) { if $0 { editing = false } }
+        .animation(.easeInOut(duration: 0.25), value: welcomeVisible)
         .frame(minWidth: 500, minHeight: 420)
         .background {
             Color.clear.alert("Vuoi riordinare i file in “\(m.offerSort?.lastPathComponent ?? "")”?",
@@ -1534,7 +1855,7 @@ struct SearchView: View {
                 }
                 Button("No, grazie", role: .cancel) {}
             } message: {
-                Text("Li dispone in sottocartelle per data e tipo, come la sezione Ordina. Vedrai prima l'anteprima e non verrà toccato nulla finché non confermi. Verrà considerata l'intera cartella, compresi i file che c'erano già.")
+                Text("Li dispone in sottocartelle per data e tipo, come la sezione Metti in ordine. Vedrai prima l'anteprima e non verrà toccato nulla finché non confermi. Verrà considerata l'intera cartella, compresi i file che c'erano già.")
             }
         }
         .alert("Spostare \(m.selectedHits.count) file?", isPresented: $confirmMove) {
@@ -1681,12 +2002,9 @@ struct DropZoneView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(targeted ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06))
-        )
+        .glass(RoundedRectangle(cornerRadius: 20, style: .continuous), tint: targeted ? Color.accentColor.opacity(0.5) : nil)
         .overlay(
-            RoundedRectangle(cornerRadius: 16)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(targeted ? Color.accentColor : Color.secondary.opacity(0.5),
                               style: StrokeStyle(lineWidth: targeted ? 3 : 2, dash: [9, 6]))
         )
@@ -1777,7 +2095,7 @@ struct PreviewTreeView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color.secondary.opacity(0.06)))
+        .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     @ViewBuilder
@@ -1886,6 +2204,49 @@ struct SearchAnimationView: View {
     private func ease(_ p: Double) -> Double { p * p * (3 - 2 * p) }
     private func passTime(_ col: Int) -> Double { sweepStart + sweepLen * (Double(col) + 0.5) / 4 }
 
+    struct Narration { let text: String; let mood: GenuzzuMood }
+
+    /// I passi che Genuzzu racconta, per ciascuna combinazione di criteri. Si scorrono a mano.
+    var script: [Narration] {
+        let d = date, k = kind != nil
+        let n = showName
+        let intro: String, how: String, find: String
+        switch (n, d, k) {
+        case (true, false, false):
+            intro = "Ecco come cercare per nome: scrivi una parte del nome del file, anche una sola parola, poi premi Invio."
+            how = "Più parole vuol dire che devono esserci tutte nel nome. Poi premi Cerca."
+            find = "Controllo il nome di ogni file, nelle cartelle che hai scelto: restano accesi solo quelli che lo contengono."
+        case (false, true, false):
+            intro = "Ecco come cercare per data: clicca due giorni sul calendario per scegliere il periodo."
+            how = "Con Modificati o Creati decidi quale data guardare. Poi premi Cerca."
+            find = "Controllo la data di ogni file: restano accesi solo quelli dentro al periodo che hai scelto."
+        case (false, false, true):
+            intro = "Ecco come cercare per tipo: scegli se ti servono immagini, video, audio, documenti o archivi."
+            how = "Hai già scelto? Allora premi Cerca."
+            find = "Controllo il tipo di ogni file: restano accesi solo quelli del tipo che hai scelto."
+        case (true, true, false):
+            intro = "Ecco come cercare per nome e data: scrivi una parte del nome e scegli il periodo sul calendario."
+            how = "I due criteri valgono insieme. Poi premi Cerca."
+            find = "Un file passa solo se ha il nome giusto e anche la data giusta. Gli altri si spengono."
+        case (true, false, true):
+            intro = "Ecco come cercare per nome e tipo: scrivi una parte del nome e scegli che tipo di file ti serve."
+            how = "I due criteri valgono insieme. Poi premi Cerca."
+            find = "Un file passa solo se ha il nome giusto ed è del tipo giusto. Gli altri si spengono."
+        case (false, true, true):
+            intro = "Ecco come cercare per data e tipo: scegli il periodo sul calendario e il tipo di file."
+            how = "I due criteri valgono insieme. Poi premi Cerca."
+            find = "Un file passa solo se è del tipo giusto e nel periodo giusto. Gli altri si spengono."
+        default:
+            intro = "Ecco come usare nome, data e tipo insieme: accendili tutti e tre e compila ciascuno."
+            how = "Più criteri accendi, più la ricerca è precisa. Poi premi Cerca."
+            find = "Un file passa solo se rispetta nome, data e tipo tutti insieme. Gli altri si spengono."
+        }
+        let done = copy ? "Trovati! Ora puoi copiarli o spostarli nella cartella di destinazione che hai scelto."
+                        : "Trovati! Sono quelli col bordo giallo. Nell'elenco li apri nel Finder col tasto destro."
+        return [Narration(text: intro, mood: .happy), Narration(text: how, mood: .happy),
+                Narration(text: find, mood: .happy), Narration(text: done, mood: .wink)]
+    }
+
     private func caption(_ t: Double) -> String {
         if t < sweepStart - 0.2 {
             switch (showName, date, kind != nil) {
@@ -1910,8 +2271,8 @@ struct SearchAnimationView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color.secondary.opacity(0.06)))
-        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .accessibilityHidden(true)
     }
 
@@ -1919,12 +2280,16 @@ struct SearchAnimationView: View {
     private func scene(t: Double, w: CGFloat, h: CGFloat) -> some View {
         let list = items
         let hits = list.indices.filter { list[$0].hit }
-        let step = min(w * 0.14, 72)
-        let cx = w * 0.33
+        // Griglia dei file + colonna del risultato, centrate insieme nello spazio disponibile.
+        let chipW: CGFloat = 62, resultW: CGFloat = 110
+        let step = min(max((w - resultW - chipW - 16) / 3, 40), 72)
+        let gridW = 3 * step + chipW
+        let left = max((w - gridW - resultW) / 2, 0)
+        let cx = left + gridW / 2
         let point = { (i: Int) -> CGPoint in
             CGPoint(x: cx + (CGFloat(i % 4) - 1.5) * step, y: h * (i < 4 ? 0.42 : 0.70))
         }
-        let target = CGPoint(x: w * 0.84, y: h * 0.56)
+        let target = CGPoint(x: left + gridW + resultW / 2, y: h * 0.56)
         let global = min(t / 0.4, 1, (cycle - t) / 0.4)
 
         ZStack {
@@ -1977,7 +2342,6 @@ struct SearchAnimationView: View {
         HStack(spacing: 6) {
             Image(systemName: symbol).foregroundStyle(Color.accentColor)
             Text(text).font(mono ? .system(.body, design: .monospaced) : .body)
-            if minWidth > 0 { Spacer(minLength: 0) }
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
         .frame(minWidth: minWidth, alignment: .leading)
@@ -1998,8 +2362,8 @@ struct SearchAnimationView: View {
             }
             .foregroundStyle(.white)
             .frame(width: 42, height: 46)
-            .background(RoundedRectangle(cornerRadius: 6).fill(f.color.gradient))
-            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.yellow, lineWidth: hit ? 3 : 0))
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(f.color.gradient))
+            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.yellow, lineWidth: hit ? 3 : 0))
             Text(f.name).font(.system(size: 9)).lineLimit(1).minimumScaleFactor(0.6)
                 .frame(width: 62)
                 .foregroundStyle(hit ? Color.primary : .secondary)
@@ -2073,13 +2437,201 @@ struct SearchAnimationView: View {
             Image(systemName: f.symbol)
                 .font(.system(size: 17)).foregroundStyle(.white)
                 .frame(width: 34, height: 38)
-                .background(RoundedRectangle(cornerRadius: 6).fill(f.color.gradient))
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(f.color.gradient))
                 .shadow(color: .black.opacity(0.25), radius: 2, y: 1)
                 .scaleEffect(1 - 0.45 * e)
                 .opacity(1 - pow(p, 4))
                 .position(x: from.x + (to.x - from.x) * e,
                           y: from.y + (to.y - from.y) * e - CGFloat(sin(.pi * e)) * 30)
         }
+    }
+}
+
+/// L'animazione della ricerca con Genuzzu a figura intera accanto, che spiega i passaggi uno alla volta.
+struct SearchCoachView: View {
+    let name: Bool
+    let date: Bool
+    let kind: FileKind?
+    let copy: Bool
+    /// Mascotte a destra dell'animazione (spazio largo) oppure sotto (spazio stretto).
+    let sideBySide: Bool
+    /// Gli interruttori di Nome, Data e Tipo: i riquadri dell'invito li accendono davvero.
+    let toggles: [Binding<Bool>]
+    @AppStorage("mascotVisible") private var visible = true
+
+    var body: some View {
+        let anim = SearchAnimationView(name: name, date: date, kind: kind, copy: copy)
+        // Nessun criterio scelto: l'animazione invita a sceglierne uno.
+        let idle = !name && !date && kind == nil
+        let layout = sideBySide ? AnyLayout(HStackLayout(alignment: .center, spacing: 12))
+                                : AnyLayout(VStackLayout(spacing: 8))
+        layout {
+            if idle { SearchInviteView(toggles: toggles).frame(minHeight: 220) } else { anim.frame(minHeight: 220) }
+            if visible && !idle {
+                // Cambiando i criteri si ricomincia dal primo passo.
+                CoachBubble(script: idle ? SearchInviteView.script : anim.script, sideBySide: sideBySide)
+                    .id("\(name)\(date)\(kind != nil)\(copy)")
+            }
+        }
+    }
+}
+
+struct CoachBubble: View {
+    let script: [SearchAnimationView.Narration]
+    let sideBySide: Bool
+    @State private var step = 0
+    @State private var talking = true
+
+    var body: some View {
+        let line = script[min(step, script.count - 1)]
+        let last = step >= script.count - 1
+        let bubble = VStack(alignment: .leading, spacing: 6) {
+            Text(line.text)
+                .font(.system(size: 12.5))
+                .fixedSize(horizontal: false, vertical: true)
+                .id(step)
+                .transition(.opacity)
+            HStack(spacing: 8) {
+                Text("\(step + 1) di \(script.count)").font(.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if step > 0 {
+                    Button { go(step - 1) } label: { Image(systemName: "chevron.left") }
+                        .help("Indietro")
+                }
+                Button { go(last ? 0 : step + 1) } label: {
+                    Label(last ? "Ricomincia" : "Avanti", systemImage: last ? "arrow.counterclockwise" : "chevron.right")
+                        .labelStyle(.titleAndIcon)
+                }
+                .keyboardShortcut(.rightArrow, modifiers: [])
+            }
+            .buttonStyle(.borderless).font(.caption.weight(.semibold))
+        }
+        .padding(.vertical, 10).padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
+        let mascot = GenuzzuView(mood: line.mood, talking: talking, fullBody: true)
+            .frame(width: 88, height: 150)
+        return Group {
+            if sideBySide {
+                VStack(spacing: 0) {
+                    bubble.glass(SpeechBubble(tail: .bottom))
+                        .padding(.bottom, 9)
+                    mascot
+                }
+                .frame(width: 210)
+            } else {
+                HStack(spacing: 2) {
+                    mascot
+                    bubble.padding(.leading, 9)
+                        .glass(SpeechBubble(tail: .left))
+                }
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: step)
+        .onAppear { speak() }
+    }
+
+    private func go(_ n: Int) {
+        step = n
+        speak()
+    }
+
+    private func speak() {
+        talking = true
+        Task {
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            talking = false
+        }
+    }
+}
+
+/// Animazione d'invito, mostrata finché non si sceglie nessun criterio: Nome, Data e Tipo si accendono
+/// uno alla volta e poi tutti insieme, per far capire che si può cercare in ogni modo.
+struct SearchInviteView: View {
+    static let script: [SearchAnimationView.Narration] = [
+        .init(text: "Ciao! Cosa vuoi cercare? Puoi partire dal nome, dalla data o dal tipo di file.", mood: .happy),
+        .init(text: "Clicca su Nome, Data o Tipo, qui o a sinistra: si accendono e ti mostrano cosa compilare.", mood: .happy),
+        .init(text: "Ne puoi accendere uno solo oppure combinarli: valgono tutti insieme e la ricerca diventa più precisa.", mood: .happy),
+        .init(text: "Quando hai scelto, premi Cerca. Io intanto resto qui a fare il tifo!", mood: .wink),
+    ]
+
+    /// Nome, Data e Tipo, nello stesso ordine dei riquadri.
+    let toggles: [Binding<Bool>]
+
+    private struct Tile { let title: String, symbol: String, sample: String }
+    private let tiles = [Tile(title: "Nome", symbol: "textformat", sample: "cliente"),
+                         Tile(title: "Data", symbol: "calendar", sample: "Ottobre"),
+                         Tile(title: "Tipo", symbol: "square.grid.2x2", sample: "Immagini")]
+    private let cycle = 9.0
+    private let together = (from: 5.0, to: 7.8)
+
+    private func ease(_ p: Double) -> Double { let c = min(max(p, 0), 1); return c * c * (3 - 2 * c) }
+    /// 1 tra `a` e `b`, con una breve dissolvenza ai bordi.
+    private func win(_ t: Double, _ a: Double, _ b: Double) -> Double {
+        ease((t - a) / 0.25) * (1 - ease((t - b) / 0.25))
+    }
+
+    var body: some View {
+        TimelineView(.animation) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: cycle)
+            GeometryReader { geo in scene(t: t, w: geo.size.width, h: geo.size.height) }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .accessibilityHidden(true)
+    }
+
+    private func scene(t: Double, w: CGFloat, h: CGFloat) -> some View {
+        let tileW = min(max((w - 48) / 3 - 14, 64), 96)
+        let gap = tileW + 16
+        let global = min(t / 0.4, 1, (cycle - t) / 0.4)
+        let all = win(t, together.from, together.to)
+        let caption = t < together.from - 0.2 ? "Scegli un criterio…" : "…oppure combinali tutti insieme"
+        return ZStack {
+            Text("Cosa vuoi cercare?").font(.title3.weight(.semibold))
+                .position(x: w / 2, y: h * 0.14)
+            ForEach(tiles.indices, id: \.self) { i in
+                let on = max(win(t, 0.6 + 1.3 * Double(i), 1.7 + 1.3 * Double(i)), all)
+                Button { toggles[i].wrappedValue = true } label: { tile(tiles[i], on: on, width: tileW) }
+                    .buttonStyle(.plain)
+                    .help("Cerca per \(tiles[i].title.lowercased())")
+                    .position(x: w / 2 + CGFloat(i - 1) * gap, y: h * 0.48)
+            }
+            ForEach(0..<2, id: \.self) { i in
+                Image(systemName: "plus").font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(Color.accentColor)
+                    .opacity(win(t, together.from + 0.3, together.to))
+                    .position(x: w / 2 + (CGFloat(i) - 0.5) * gap, y: h * 0.48)
+            }
+            Image(systemName: "magnifyingglass.circle.fill").font(.system(size: 34))
+                .foregroundStyle(Color.accentColor)
+                .opacity(all)
+                .scaleEffect(0.7 + 0.3 * all)
+                .position(x: w / 2, y: h * 0.76)
+            Text(caption).font(.callout.weight(.medium)).foregroundStyle(.secondary)
+                .lineLimit(1).minimumScaleFactor(0.7)
+                .position(x: w / 2, y: h * 0.92)
+        }
+        .opacity(max(global, 0))
+    }
+
+    private func tile(_ f: Tile, on: Double, width: CGFloat) -> some View {
+        VStack(spacing: 6) {
+            Image(systemName: f.symbol).font(.system(size: 24))
+                .foregroundStyle(on > 0.5 ? Color.accentColor : .secondary)
+            Text(f.title).font(.headline)
+            Text(f.sample).font(.system(size: 10, design: .monospaced))
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(Color(nsColor: .textBackgroundColor)))
+                .opacity(0.4 + 0.6 * on)
+        }
+        .frame(width: width, height: 100)
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(Color.accentColor.opacity(0.04 + 0.14 * on)))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(on > 0.5 ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: on > 0.5 ? 2 : 1))
+        .scaleEffect(1 + 0.08 * on)
     }
 }
 
@@ -2170,7 +2722,7 @@ struct SortAnimationView: View {
                             }
                                 .foregroundStyle(.white)
                                 .frame(width: 44, height: 50)
-                                .background(RoundedRectangle(cornerRadius: 6).fill(item.color.gradient))
+                                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(item.color.gradient))
                                 .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
                                 .rotationEffect(.degrees(item.rotation * (1 - e)))
                                 .scaleEffect(1 - 0.5 * e)
@@ -2183,8 +2735,8 @@ struct SortAnimationView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(RoundedRectangle(cornerRadius: 16).fill(Color.secondary.opacity(0.06)))
-        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
         .accessibilityHidden(true)
     }
 }
@@ -2197,6 +2749,8 @@ enum GenuzzuMood { case happy, shocked, oops, wink }
 struct GenuzzuView: View {
     var mood: GenuzzuMood = .happy
     var talking = false
+    /// Figura intera (testa, busto, braccia, gambe) invece del solo mezzo busto.
+    var fullBody = false
 
     private static let skin = Color(red: 0.99, green: 0.83, blue: 0.65)
     private static let shirt = Color(red: 0.12, green: 0.18, blue: 0.40)
@@ -2207,17 +2761,20 @@ struct GenuzzuView: View {
         TimelineView(.animation(minimumInterval: 1.0 / 20)) { tl in
             let t = tl.date.timeIntervalSinceReferenceDate
             Canvas { ctx, size in
-                let s = min(size.width / 200, size.height / 190)
+                let h: CGFloat = fullBody ? 345 : 190
+                let s = min(size.width / 200, size.height / h)
                 var c = ctx
-                c.translateBy(x: (size.width - 200 * s) / 2, y: (size.height - 190 * s) / 2)
+                c.translateBy(x: (size.width - 200 * s) / 2, y: (size.height - h * s) / 2)
                 c.scaleBy(x: s, y: s)
-                // Dondola appena, come uno che non sta mai fermo.
-                c.translateBy(x: 100, y: 175 + sin(t * 2.2) * 1.5)
-                c.rotate(by: .degrees(sin(t * 1.3) * 1.8))
-                c.translateBy(x: -100, y: -175)
+                // Dondola appena, come uno che non sta mai fermo (a figura intera resta con i piedi a terra).
+                let pivot: CGFloat = fullBody ? 330 : 175
+                c.translateBy(x: 100, y: pivot + (fullBody ? 0 : sin(t * 2.2) * 1.5))
+                c.rotate(by: .degrees(sin(t * 1.3) * (fullBody ? 1.0 : 1.8)))
+                c.translateBy(x: -100, y: -pivot)
                 let blink = t.truncatingRemainder(dividingBy: 4.3) < 0.14
                 let open = talking ? 0.35 + 0.65 * abs(sin(t * 9)) : 0.55
-                Self.draw(c, mood: mood, blink: blink, open: open, look: sin(t * 0.7) * 2)
+                if fullBody { Self.drawBody(c, wave: sin(t * 3.2), talking: talking) }
+                Self.draw(c, mood: mood, blink: blink, open: open, look: sin(t * 0.7) * 2, fullBody: fullBody)
             }
         }
         .accessibilityHidden(true)
@@ -2236,7 +2793,44 @@ struct GenuzzuView: View {
         Path(ellipseIn: CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2))
     }
 
-    private static func draw(_ c: GraphicsContext, mood: GenuzzuMood, blink: Bool, open: Double, look: Double) {
+    /// Busto, braccia e gambe: il braccio sinistro (a sinistra di chi guarda) indica l'animazione.
+    private static func drawBody(_ c: GraphicsContext, wave: Double, talking: Bool) {
+        let jeans = Color(white: 0.30)
+        let w = CGFloat(talking ? wave : 0) * 5
+        // Gambe e scarpe
+        for x: CGFloat in [62, 104] {
+            fillStroke(c, Path(roundedRect: CGRect(x: x, y: 256, width: 34, height: 66), cornerRadius: 8), jeans)
+            fillStroke(c, Path(ellipseIn: CGRect(x: x - 6, y: 316, width: 46, height: 22)), .white)
+        }
+        // Busto
+        var torso = Path()
+        torso.move(to: CGPoint(x: 46, y: 190))
+        torso.addLine(to: CGPoint(x: 52, y: 262))
+        torso.addLine(to: CGPoint(x: 148, y: 262))
+        torso.addLine(to: CGPoint(x: 154, y: 190))
+        torso.closeSubpath()
+        fillStroke(c, torso, shirt)
+        // Ogni braccio è un tratto per la manica e uno per l'avambraccio: prima l'avambraccio, poi la manica sopra.
+        func seg(_ from: CGPoint, _ to: CGPoint, _ color: Color, _ width: CGFloat) {
+            var path = Path()
+            path.move(to: from)
+            path.addLine(to: to)
+            stroke(c, path, width + 5)
+            stroke(c, path, width, color)
+        }
+        // Braccio che indica l'animazione (a sinistra di chi guarda), con la mano che saluta
+        let hand = CGPoint(x: 20 + w * 1.2, y: 170)
+        seg(CGPoint(x: 28, y: 226), hand, skin, 11)
+        seg(CGPoint(x: 52, y: 205), CGPoint(x: 28, y: 226), shirt, 17)
+        fillStroke(c, circle(hand.x, hand.y - 4, 10), skin, 3)
+        // Braccio lungo il fianco
+        seg(CGPoint(x: 160, y: 238), CGPoint(x: 158, y: 268), skin, 11)
+        seg(CGPoint(x: 148, y: 205), CGPoint(x: 160, y: 238), shirt, 17)
+        fillStroke(c, circle(158, 275, 9), skin, 3)
+    }
+
+    private static func draw(_ c: GraphicsContext, mood: GenuzzuMood, blink: Bool, open: Double, look: Double,
+                             fullBody: Bool = false) {
         // Maglietta blu e collo
         var shirtPath = Path()
         shirtPath.move(to: CGPoint(x: 44, y: 194))
@@ -2245,7 +2839,18 @@ struct GenuzzuView: View {
         shirtPath.addCurve(to: CGPoint(x: 156, y: 194), control1: CGPoint(x: 138, y: 170), control2: CGPoint(x: 154, y: 176))
         shirtPath.closeSubpath()
         fillStroke(c, Path(CGRect(x: 86, y: 150, width: 28, height: 24)), skin)
-        fillStroke(c, shirtPath, shirt)
+        if fullBody {
+            // Il resto della maglietta è già disegnato: qui solo spalle e colletto, senza il bordo in basso.
+            c.fill(shirtPath, with: .color(shirt))
+            var shoulders = Path()
+            shoulders.move(to: CGPoint(x: 44, y: 194))
+            shoulders.addCurve(to: CGPoint(x: 78, y: 166), control1: CGPoint(x: 46, y: 176), control2: CGPoint(x: 62, y: 170))
+            shoulders.addLine(to: CGPoint(x: 122, y: 166))
+            shoulders.addCurve(to: CGPoint(x: 156, y: 194), control1: CGPoint(x: 138, y: 170), control2: CGPoint(x: 154, y: 176))
+            stroke(c, shoulders)
+        } else {
+            fillStroke(c, shirtPath, shirt)
+        }
         var neck = Path()
         neck.move(to: CGPoint(x: 83, y: 166))
         neck.addQuadCurve(to: CGPoint(x: 117, y: 166), control: CGPoint(x: 100, y: 190))
@@ -2471,7 +3076,7 @@ struct GenuzzuFooter: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.vertical, 8).padding(.trailing, 12).padding(.leading, 21)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(SpeechBubble().fill(Color.secondary.opacity(0.12)))
+                    .glass(SpeechBubble())
             }
             .frame(height: 88)
             .padding(.horizontal).padding(.bottom, 6)
@@ -2505,8 +3110,119 @@ struct GenuzzuFooter: View {
     }
 }
 
+// MARK: - Liquid Glass
+
+extension View {
+    /// Liquid Glass su macOS 26 e successivi; su sistemi più vecchi un vetro smerigliato semplice.
+    @ViewBuilder
+    func glass<S: Shape>(_ shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
+        if #available(macOS 26, *) {
+            self.glassEffect(Self.makeGlass(tint: tint, interactive: interactive), in: shape)
+        } else {
+            self.background(shape.fill(.ultraThinMaterial)).background(shape.fill(tint?.opacity(0.18) ?? .clear))
+        }
+    }
+
+    @available(macOS 26, *)
+    private static func makeGlass(tint: Color?, interactive: Bool) -> Glass {
+        var g = Glass.regular
+        if let tint { g = g.tint(tint) }
+        if interactive { g = g.interactive() }
+        return g
+    }
+
+    /// Pulsante principale in vetro (Liquid Glass) con colore a scelta.
+    @ViewBuilder
+    func prominentGlass(tint: Color? = nil) -> some View {
+        if #available(macOS 26, *) {
+            self.buttonStyle(.glassProminent).tint(tint)
+        } else {
+            self.buttonStyle(.borderedProminent).tint(tint)
+        }
+    }
+}
+
+/// Fondale colorato e morbido dietro la finestra: il vetro ha così qualcosa da rifrangere.
+struct AmbientBackground: View {
+    var body: some View {
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+            RadialGradient(colors: [Color.blue.opacity(0.30), .clear], center: .topLeading, startRadius: 0, endRadius: 560)
+            RadialGradient(colors: [Color.teal.opacity(0.20), .clear], center: .topTrailing, startRadius: 0, endRadius: 460)
+            RadialGradient(colors: [Color.purple.opacity(0.24), .clear], center: .bottomTrailing, startRadius: 0, endRadius: 620)
+            RadialGradient(colors: [Color.orange.opacity(0.12), .clear], center: .bottomLeading, startRadius: 0, endRadius: 420)
+        }
+        .ignoresSafeArea()
+    }
+}
+
+/// Barra di avanzamento senza fine: la ricerca non sa in anticipo quanti file ci sono.
+struct SearchProgressBar: View {
+    var body: some View {
+        TimelineView(.animation) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate
+            let p = t.truncatingRemainder(dividingBy: 1.4) / 1.4
+            let e = 0.5 - 0.5 * cos(p * .pi)
+            GeometryReader { geo in
+                let seg = geo.size.width * 0.34
+                Capsule().fill(Color.secondary.opacity(0.18))
+                    .overlay(alignment: .leading) {
+                        Capsule()
+                            .fill(LinearGradient(colors: [.yellow, .orange], startPoint: .leading, endPoint: .trailing))
+                            .frame(width: seg)
+                            .offset(x: -seg + (geo.size.width + seg) * CGFloat(e))
+                    }
+                    .clipShape(Capsule())
+            }
+        }
+        .frame(height: 6)
+        .accessibilityLabel("Ricerca in corso")
+    }
+}
+
+/// Genuzzu come titolo di una sezione: più grande del consiglio a piè di pagina, con il fumetto colorato per farsi notare.
+struct GenuzzuTitleBar: View {
+    let title: String
+    let text: String
+    @State private var talking = false
+
+    var body: some View {
+        HStack(spacing: 2) {
+            GenuzzuView(mood: .happy, talking: talking)
+                .frame(width: 100, height: 95)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 17, weight: .heavy))
+                Text(text).font(.system(size: 13, weight: .regular)).foregroundStyle(.primary.opacity(0.85))
+            }
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.vertical, 12).padding(.trailing, 16).padding(.leading, 23)
+                .frame(maxWidth: .infinity, minHeight: 70, alignment: .leading)
+                .glass(SpeechBubble(), tint: Color.yellow.opacity(0.55))
+        }
+        .padding(.horizontal).padding(.top, 10)
+        .onAppear {
+            talking = true
+            Task { try? await Task.sleep(nanoseconds: 2_500_000_000); talking = false }
+        }
+    }
+}
+
 struct SpeechBubble: Shape {
+    enum Tail { case left, bottom }
+    var tail: Tail = .left
+
     func path(in r: CGRect) -> Path {
+        if tail == .bottom {
+            // Il fumetto occupa tutto il rettangolo; la codina sporge sotto, verso la testa di Genuzzu.
+            let body = CGRect(x: r.minX, y: r.minY, width: r.width, height: r.height)
+            var p = Path(roundedRect: body, cornerRadius: 12)
+            let x = r.midX
+            p.move(to: CGPoint(x: x - 8, y: body.maxY - 1))
+            p.addLine(to: CGPoint(x: x, y: body.maxY + 9))
+            p.addLine(to: CGPoint(x: x + 8, y: body.maxY - 1))
+            p.closeSubpath()
+            return p
+        }
         let tail: CGFloat = 9
         let body = CGRect(x: r.minX + tail, y: r.minY, width: r.width - tail, height: r.height)
         var p = Path(roundedRect: body, cornerRadius: 12)
@@ -2597,6 +3313,8 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .background(AmbientBackground())
         .frame(width: 520)
         .fixedSize(horizontal: false, vertical: true)
     }
