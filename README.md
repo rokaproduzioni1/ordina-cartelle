@@ -1,4 +1,4 @@
-# Ordina Cartelle
+# Genuzzu
 
 App per macOS (SwiftUI) che ordina i file di una cartella in sottocartelle per data e tipo
 (di default `Anno/Mese/Tipo`). Anteprima prima di spostare, annullamento dell'ultima operazione,
@@ -9,7 +9,7 @@ Servono i Command Line Tools di Xcode.
 
     ./build.sh
 
-Crea `OrdinaCartelle.app` nella cartella del progetto.
+Crea `Genuzzu.app` nella cartella del progetto.
 
 ## Rilasciare un aggiornamento
 1. Modifica il numero in `VERSION` (es. `1.1.0`), fai commit e push.
