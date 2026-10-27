@@ -296,9 +296,23 @@ enum Updater {
         }.value
     }
 
+    private static func ghPath() -> String? {
+        ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"].first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private static func run(_ exe: String, _ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
     private static func viaGH() -> Data? {
-        guard let gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"].first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-        else { return nil }
+        guard let gh = ghPath() else { return nil }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: gh)
         p.arguments = ["api", "repos/\(repo)/releases/latest"]
@@ -334,22 +348,76 @@ enum Updater {
         return false
     }
 
+    static var autoInstallEnabled: Bool {
+        UserDefaults.standard.object(forKey: "autoInstall") as? Bool ?? true
+    }
+
+    /// Scarica lo zip della release, lo estrae e sostituisce l'app in esecuzione.
+    static func install(_ r: Release) async -> Bool {
+        await Task.detached { () -> Bool in
+            let fm = FileManager.default
+            let tmp = fm.temporaryDirectory.appendingPathComponent("ordina-update-\(UUID().uuidString)")
+            defer { try? fm.removeItem(at: tmp) }
+            let out = tmp.appendingPathComponent("x")
+            guard Bundle.main.bundleURL.pathExtension == "app",
+                  let gh = ghPath(),
+                  (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil,
+                  run(gh, ["release", "download", "v\(r.version)", "-R", repo, "-p", "*.zip", "-D", tmp.path]) == 0,
+                  let zip = (try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "zip" }),
+                  run("/usr/bin/ditto", ["-x", "-k", zip.path, out.path]) == 0 else { return false }
+            let newApp = out.appendingPathComponent("OrdinaCartelle.app")
+            guard fm.fileExists(atPath: newApp.path) else { return false }
+            _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", newApp.path])
+            return (try? fm.replaceItemAt(Bundle.main.bundleURL, withItemAt: newApp)) != nil
+        }.value
+    }
+
+    static func relaunch() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "sleep 1; open \"$0\"", Bundle.main.bundleURL.path]
+        try? p.run()
+        NSApp.terminate(nil)
+    }
+
     @MainActor
     static func check(silent: Bool) async {
         guard let r = await latest() else {
             if !silent { alert("Impossibile controllare gli aggiornamenti", "Verifica la connessione e che GitHub sia raggiungibile.") }
             return
         }
-        if isNewer(r.version, than: currentVersion) {
+        guard isNewer(r.version, than: currentVersion) else {
+            if !silent { alert("Sei aggiornato", "Stai usando l'ultima versione (\(currentVersion)).") }
+            return
+        }
+        if !autoInstallEnabled {
             let a = NSAlert()
             a.messageText = "È disponibile la versione \(r.version)"
-            a.informativeText = "Stai usando la \(currentVersion). Vuoi aprire la pagina di download?"
-            a.addButton(withTitle: "Scarica")
+            a.informativeText = "Stai usando la \(currentVersion). Vuoi installarla ora?"
+            a.addButton(withTitle: "Installa ora")
+            a.addButton(withTitle: "Apri pagina")
             a.addButton(withTitle: "Più tardi")
-            if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(r.url) }
-        } else if !silent {
-            alert("Sei aggiornato", "Stai usando l'ultima versione (\(currentVersion)).")
+            switch a.runModal() {
+            case .alertFirstButtonReturn: break
+            case .alertSecondButtonReturn: NSWorkspace.shared.open(r.url); return
+            default: return
+            }
         }
+        guard await install(r) else {
+            let a = NSAlert()
+            a.messageText = "Installazione automatica non riuscita"
+            a.informativeText = "Puoi scaricare la versione \(r.version) dalla pagina della release."
+            a.addButton(withTitle: "Apri pagina")
+            a.addButton(withTitle: "Chiudi")
+            if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(r.url) }
+            return
+        }
+        let a = NSAlert()
+        a.messageText = "Versione \(r.version) installata"
+        a.informativeText = "Riavvia l'app per usare la nuova versione."
+        a.addButton(withTitle: "Riavvia ora")
+        a.addButton(withTitle: "Più tardi")
+        if a.runModal() == .alertFirstButtonReturn { relaunch() }
     }
 
     @MainActor
@@ -581,6 +649,7 @@ struct SettingsView: View {
     @AppStorage("excludedExts") private var excluded = ""
     @AppStorage("minAgeDays") private var minAgeDays = 0
     @AppStorage("autoUpdateCheck") private var autoUpdateCheck = true
+    @AppStorage("autoInstall") private var autoInstall = true
 
     var body: some View {
         Form {
@@ -615,6 +684,7 @@ struct SettingsView: View {
             Section("Aggiornamenti") {
                 LabeledContent("Versione installata", value: Updater.currentVersion)
                 Toggle("Controlla gli aggiornamenti all'avvio", isOn: $autoUpdateCheck)
+                Toggle("Installa automaticamente gli aggiornamenti", isOn: $autoInstall)
                 Button("Controlla ora") { Task { await Updater.check(silent: false) } }
             }
         }
