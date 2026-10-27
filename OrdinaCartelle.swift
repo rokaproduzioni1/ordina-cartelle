@@ -420,7 +420,7 @@ final class ViewModel: ObservableObject {
                 self.busy = false
                 self.status = result.isEmpty
                     ? "Niente da spostare: la cartella è già in ordine."
-                    : "\(result.count) file da spostare. Controlla l'anteprima, poi premi “Ordina”."
+                    : "\(result.count) file verranno spostati in \(Set(result.map { $0.dest.deletingLastPathComponent() }).count) cartelle. Nessun file è stato ancora toccato: controlla l'anteprima, poi premi “Ordina”."
             }
         }
     }
@@ -456,6 +456,12 @@ final class ViewModel: ObservableObject {
         }
     }
 
+    var groups: [(folder: String, moves: [PlannedMove])] {
+        Dictionary(grouping: moves) { relative($0.dest.deletingLastPathComponent()) }
+            .map { (folder: $0.key, moves: $0.value) }
+            .sorted { $0.folder.localizedStandardCompare($1.folder) == .orderedAscending }
+    }
+
     func relative(_ url: URL) -> String {
         guard let root = folder else { return url.path }
         let p = url.standardizedFileURL.path
@@ -467,6 +473,7 @@ final class ViewModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var vm = ViewModel()
+    @State private var previewMode = 0
     @Environment(\.openWindow) private var openWindow
     @AppStorage("autoUpdateCheck") private var autoUpdateCheck = true
     @AppStorage("layout") private var layout = Layout.yearMonthType.rawValue
@@ -502,11 +509,38 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity)
             } else {
-                List(vm.moves) { m in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(m.source.lastPathComponent).font(.body)
-                        Text("→ " + vm.relative(m.dest.deletingLastPathComponent()) + "/" + m.dest.lastPathComponent)
-                            .font(.caption).foregroundStyle(.secondary)
+                Picker("Anteprima", selection: $previewMode) {
+                    Text("Per cartella").tag(0)
+                    Text("Elenco").tag(1)
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 220)
+
+                if previewMode == 0 {
+                    List {
+                        ForEach(vm.groups, id: \.folder) { g in
+                            Section {
+                                ForEach(g.moves) { m in
+                                    HStack {
+                                        Image(systemName: "doc")
+                                        Text(m.dest.lastPathComponent)
+                                        if m.dest.lastPathComponent != m.source.lastPathComponent {
+                                            Text("(da \(m.source.lastPathComponent))").foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            } header: {
+                                Label("\(g.folder)  ·  \(g.moves.count) file", systemImage: "folder.fill")
+                                    .font(.headline)
+                            }
+                        }
+                    }
+                } else {
+                    List(vm.moves) { m in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(vm.relative(m.source)).font(.body)
+                            Text("→ " + vm.relative(m.dest))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
