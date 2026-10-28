@@ -303,7 +303,8 @@ enum Organizer {
     /// Cartella (dentro quella da ordinare) dove vanno i doppioni esatti.
     static let duplicatesFolder = "Duplicati"
 
-    static func plan(root: URL, recursive: Bool, settings: Prefs) -> [PlannedMove] {
+    static func plan(root: URL, recursive: Bool, settings: Prefs,
+                     report: ((_ text: String, _ fraction: Double?) -> Void)? = nil) -> [PlannedMove] {
         let fm = FileManager.default
         var options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
         if !recursive { options.insert(.skipsSubdirectoryDescendants) }
@@ -313,10 +314,13 @@ enum Organizer {
 
         struct Entry { let url: URL; let dir: URL; let size: Int64; let modified: Date }
         var entries: [Entry] = []
+        var scanned = 0
 
         for case let url as URL in en {
             let v = try? url.resourceValues(forKeys: Set(keys))
             guard v?.isRegularFile == true, v?.isPackage != true else { continue }
+            scanned += 1
+            report?("\(scanned) file analizzati", nil)
 
             let ext = url.pathExtension.lowercased()
             if partialExts.contains(ext) || settings.excludedExts.contains(ext) { continue }
@@ -341,7 +345,9 @@ enum Organizer {
         var originalOf: [String: URL] = [:]
         if settings.moveDuplicates {
             let byPath = Dictionary(entries.map { ($0.url.path, $0) }, uniquingKeysWith: { a, _ in a })
-            for group in Duplicates.groups(entries.map { ($0.url, $0.size) }) {
+            for group in Duplicates.groups(entries.map { ($0.url, $0.size) }, progress: { d, t in
+                report?("Ricerca doppioni: \(d) di \(t) gruppi", Double(d) / Double(max(t, 1)))
+            }) {
                 let ranked = group.compactMap { byPath[$0.path] }.sorted { a, b in
                     func key(_ e: Entry) -> (Int, Int, Date, Int, String) {
                         let inDup = e.url.deletingLastPathComponent().standardizedFileURL == dupDir
@@ -401,11 +407,12 @@ enum Organizer {
         return try? JSONDecoder().decode(UndoLog.self, from: data)
     }
 
-    static func apply(_ moves: [PlannedMove], root: URL) -> (done: Int, failed: Int) {
+    static func apply(_ moves: [PlannedMove], root: URL,
+                      progress: ((_ done: Int, _ total: Int) -> Void)? = nil) -> (done: Int, failed: Int) {
         let fm = FileManager.default
         var pairs: [[String]] = []
         var failed = 0
-        for m in moves {
+        for (i, m) in moves.enumerated() {
             do {
                 try fm.createDirectory(at: m.dest.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.moveItem(at: m.source, to: m.dest)
@@ -413,17 +420,19 @@ enum Organizer {
             } catch {
                 failed += 1
             }
+            progress?(i + 1, moves.count)
         }
         let log = UndoLog(root: root.path, pairs: pairs)
         if let data = try? JSONEncoder().encode(log) { try? data.write(to: logURL) }
         return (pairs.count, failed)
     }
 
-    static func undo(_ log: UndoLog) -> (restored: Int, failed: Int) {
+    static func undo(_ log: UndoLog, progress: ((_ done: Int, _ total: Int) -> Void)? = nil) -> (restored: Int, failed: Int) {
         let fm = FileManager.default
         let root = URL(fileURLWithPath: log.root).standardizedFileURL
         var restored = 0, failed = 0
-        for pair in log.pairs.reversed() {
+        for (i, pair) in log.pairs.reversed().enumerated() {
+            defer { progress?(i + 1, log.pairs.count) }
             let src = URL(fileURLWithPath: pair[0]), dest = URL(fileURLWithPath: pair[1])
             guard fm.fileExists(atPath: dest.path), !fm.fileExists(atPath: src.path) else { failed += 1; continue }
             do {
@@ -632,6 +641,11 @@ final class ViewModel: ObservableObject {
     @Published var moves: [PlannedMove] = []
     @Published var recursive = false { didSet { scan() } }
     @Published var busy = false
+    /// Avanzamento 0...1 dell'operazione in corso; nil quando la durata non è prevedibile.
+    @Published var progress: Double? {
+        didSet { NSApp?.dockTile.badgeLabel = progress.map { "\(Int($0 * 100))%" } }
+    }
+    @Published var progressText = ""
     @Published var status = "Scegli una cartella da ordinare."
     @Published var canUndo = Organizer.loadLog() != nil
     enum Phase { case idle, preview, ordered, done }
@@ -641,6 +655,21 @@ final class ViewModel: ObservableObject {
     init() {
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.settingsChanged() }
+        }
+    }
+
+    /// Callback per il thread di lavoro: aggiorna la barra al massimo ~12 volte al secondo.
+    private func makeReport() -> (String, Double?) -> Void {
+        var last = Date.distantPast
+        return { [weak self] text, fraction in
+            let now = Date()
+            guard (fraction ?? 0) >= 1 || now.timeIntervalSince(last) > 0.08 else { return }
+            last = now
+            Task { @MainActor in
+                guard let self, self.busy else { return }
+                self.progress = fraction
+                self.progressText = text
+            }
         }
     }
 
@@ -682,15 +711,19 @@ final class ViewModel: ObservableObject {
     func scan() {
         guard let root = folder else { return }
         busy = true
+        progress = nil
+        progressText = "Analisi in corso…"
         status = "Analisi in corso…"
         let rec = recursive
         let settings = Prefs.current
+        let report = makeReport()
         Task.detached {
-            let result = Organizer.plan(root: root, recursive: rec, settings: settings)
+            let result = Organizer.plan(root: root, recursive: rec, settings: settings, report: report)
             let dups = result.filter { $0.duplicateOf != nil }.count
             await MainActor.run {
                 self.moves = result
                 self.busy = false
+                self.progress = nil
                 self.phase = result.isEmpty ? .ordered : .preview
                 self.status = result.isEmpty
                     ? "Niente da spostare: la cartella è già in ordine."
@@ -705,11 +738,17 @@ final class ViewModel: ObservableObject {
         guard let root = folder, !moves.isEmpty else { return }
         let plan = moves
         busy = true
+        progress = 0
+        progressText = "Spostati 0 di \(plan.count) file"
         status = "Spostamento in corso…"
+        let report = makeReport()
         Task.detached {
-            let r = Organizer.apply(plan, root: root)
+            let r = Organizer.apply(plan, root: root) { done, total in
+                report("Spostati \(done) di \(total) file", Double(done) / Double(max(total, 1)))
+            }
             await MainActor.run {
                 self.busy = false
+                self.progress = nil
                 self.canUndo = Organizer.loadLog() != nil
                 self.moves = []
                 self.phase = .done
@@ -721,11 +760,17 @@ final class ViewModel: ObservableObject {
     func undo() {
         guard let log = Organizer.loadLog() else { return }
         busy = true
+        progress = 0
+        progressText = "Ripristinati 0 di \(log.pairs.count) file"
         status = "Ripristino in corso…"
+        let report = makeReport()
         Task.detached {
-            let r = Organizer.undo(log)
+            let r = Organizer.undo(log) { done, total in
+                report("Ripristinati \(done) di \(total) file", Double(done) / Double(max(total, 1)))
+            }
             await MainActor.run {
                 self.busy = false
+                self.progress = nil
                 self.canUndo = Organizer.loadLog() != nil
                 self.status = "Annullato: \(r.restored) file ripristinati" + (r.failed > 0 ? ", \(r.failed) non ripristinati." : ".")
                 self.scan()
@@ -914,7 +959,17 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.25), value: vm.moves.isEmpty)
 
             HStack {
-                if vm.busy { ProgressView().controlSize(.small) }
+                if vm.busy {
+                    if let p = vm.progress {
+                        ProgressView(value: p).frame(width: 180)
+                        Text("\(Int(p * 100))%").font(.callout.weight(.semibold)).monospacedDigit()
+                            .frame(width: 42, alignment: .trailing)
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(vm.progressText).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                        .lineLimit(1)
+                }
                 Button { showDuplicates = true } label: { Label("Cerca duplicati", systemImage: "square.on.square") }
                     .disabled(vm.folder == nil || vm.busy)
                     .help("Trova i file con contenuto identico nella cartella scelta")
