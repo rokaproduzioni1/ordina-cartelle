@@ -892,6 +892,8 @@ final class SearchModel: ObservableObject {
     @Published var scanned = 0
     private var deepTask: Task<Void, Never>?
     private static let maxHits = 5000
+    /// Chiamata a ricerca conclusa (anche se interrotta): la usa la barra dei menu per aprire i risultati.
+    var onFinish: (() -> Void)?
 
     struct Volume: Identifiable {
         let url: URL
@@ -1068,6 +1070,7 @@ final class SearchModel: ObservableObject {
         searching = false
         let n = hits.count
         status = n == 0 ? "Nessun file trovato (controllati \(scanned))." : "\(n) file trovati su \(scanned) controllati."
+        onFinish?()
     }
 
     func clear() {
@@ -3432,8 +3435,171 @@ struct SettingsView: View {
     }
 }
 
+// MARK: - Barra dei menu
+
+/// Ricerca rapida per nome dalla barra dei menu: cerca in tutto il Mac, nei dischi esterni e in rete.
+struct MenuBarSearchView: View {
+    @ObservedObject var m: SearchModel
+    @Environment(\.openWindow) private var openWindow
+    @FocusState private var focused: Bool
+
+    private var ready: Bool { m.text.trimmingCharacters(in: .whitespaces).count >= 2 }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Cerca file per nome", systemImage: "magnifyingglass")
+                .font(.headline)
+            HStack {
+                TextField("Nome del file", text: $m.text)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focused)
+                    .disabled(m.searching)
+                    .onSubmit(start)
+                if m.searching {
+                    Button("Ferma") { m.stop() }
+                } else {
+                    Button("Cerca", action: start).prominentGlass().disabled(!ready)
+                }
+            }
+            if m.searching {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("\(m.scanned) file controllati, \(m.all.count) trovati")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("Cerco in tutto il Mac e nei dischi esterni e di rete collegati.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            Divider()
+            HStack {
+                Button("Apri Genuzzu") {
+                    NSApp.activate(ignoringOtherApps: true)
+                    if let w = NSApp.windows.first(where: { $0.canBecomeMain }) { w.makeKeyAndOrderFront(nil) }
+                }
+                Spacer()
+                Button("Esci") { NSApp.terminate(nil) }
+            }
+            .buttonStyle(.link)
+        }
+        .padding(16)
+        .frame(width: 360)
+        .onAppear {
+            m.useName = true
+            m.searchComputer = true
+            m.searchExternal = true
+            m.searchNetwork = true
+            m.refreshVolumes()
+            m.onFinish = {
+                openWindow(id: "menu-results")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            focused = true
+        }
+    }
+
+    private func start() {
+        guard ready, !m.searching else { return }
+        m.search()
+    }
+}
+
+/// Finestra con i risultati della ricerca dalla barra dei menu.
+struct MenuBarResultsView: View {
+    @ObservedObject var m: SearchModel
+    @State private var selection = Set<String>()
+
+    private func preview() {
+        let urls = m.hits.map(\.url)
+        let i = m.hits.firstIndex { selection.contains($0.id) } ?? 0
+        QuickLook.shared.toggle(urls, index: i)
+    }
+
+    /// Disco e cartella che contiene il file.
+    private func place(_ url: URL) -> (badge: String, symbol: String, color: Color, folder: String) {
+        let dir = url.deletingLastPathComponent().path
+        if dir.hasPrefix("/Volumes/") {
+            let parts = dir.dropFirst("/Volumes/".count).split(separator: "/")
+            let name = parts.first.map(String.init) ?? "Disco"
+            let network = m.volumes.first { $0.url.lastPathComponent == name }?.network ?? false
+            return (name, network ? "network" : "externaldrive", network ? .purple : .teal,
+                    parts.count > 1 ? parts.last.map(String.init) ?? "" : "Radice del disco")
+        }
+        return ("Questo Mac", "desktopcomputer", .blue, url.deletingLastPathComponent().lastPathComponent)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text(m.text.isEmpty ? "Risultati" : "Risultati per “\(m.text)”").font(.title3.weight(.semibold))
+                Spacer()
+                Text(m.status).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if m.hits.isEmpty {
+                ContentUnavailableView("Nessun file trovato", systemImage: "magnifyingglass",
+                                       description: Text("Prova con un altro nome o una parte più corta."))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(m.hits, selection: $selection) { h in
+                    let p = place(h.url)
+                    HStack(spacing: 12) {
+                        FileThumbnail(url: h.url)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(h.name).font(.system(size: 14, weight: .semibold))
+                                .lineLimit(1).truncationMode(.middle)
+                            HStack(spacing: 6) {
+                                Label(p.badge, systemImage: p.symbol)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(p.color)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Capsule().fill(p.color.opacity(0.16)))
+                                    .lineLimit(1)
+                                Text(p.folder).font(.system(size: 12)).lineLimit(1).truncationMode(.head)
+                            }
+                            .help(h.url.deletingLastPathComponent().path)
+                        }
+                        Spacer(minLength: 8)
+                        VStack(alignment: .trailing, spacing: 2) {
+                            if let s = h.size {
+                                Text(ByteCountFormatter.string(fromByteCount: s, countStyle: .file))
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            if let d = h.date {
+                                Text(d.formatted(date: .abbreviated, time: .omitted))
+                                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                            }
+                        }
+                        .monospacedDigit().fixedSize()
+                        Button { NSWorkspace.shared.activateFileViewerSelecting([h.url]) } label: { Image(systemName: "folder") }
+                            .buttonStyle(.borderless).help("Mostra nel Finder")
+                    }
+                    .padding(.vertical, 5)
+                    .tag(h.id)
+                }
+                .scrollContentBackground(.hidden)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .contextMenu(forSelectionType: String.self) { ids in
+                    Button("Anteprima") { preview() }
+                    Button("Mostra nel Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting(ids.map { URL(fileURLWithPath: $0) })
+                    }
+                } primaryAction: { ids in
+                    NSWorkspace.shared.open(ids.compactMap { URL(fileURLWithPath: $0) }.first ?? URL(fileURLWithPath: "/"))
+                }
+                .onKeyPress(.space) { preview(); return .handled }
+            }
+        }
+        .padding()
+        .frame(minWidth: 560, minHeight: 360)
+        .background(AmbientBackground())
+    }
+}
+
 @main
 struct OrdinaCartelleApp: App {
+    @StateObject private var quickSearch = SearchModel()
+
     var body: some Scene {
         WindowGroup("Genuzzu") { ContentView() }
             .commands {
@@ -3443,5 +3609,9 @@ struct OrdinaCartelleApp: App {
             }
         Window("Impostazioni", id: "settings") { SettingsView() }
             .windowResizability(.contentSize)
+        MenuBarExtra("Genuzzu", systemImage: "magnifyingglass") { MenuBarSearchView(m: quickSearch) }
+            .menuBarExtraStyle(.window)
+        Window("Risultati ricerca", id: "menu-results") { MenuBarResultsView(m: quickSearch) }
+            .defaultSize(width: 720, height: 480)
     }
 }
