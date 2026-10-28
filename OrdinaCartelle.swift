@@ -456,7 +456,7 @@ enum Updater {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
     }
 
-    struct Release { let version: String; let url: URL }
+    struct Release { let version: String; let url: URL; let zip: URL? }
 
     /// Usa `gh` (già autenticato sul Mac, funziona anche con repo privato); in alternativa l'API pubblica.
     static func latest() async -> Release? {
@@ -465,7 +465,11 @@ enum Updater {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let tag = json["tag_name"] as? String,
                   let page = (json["html_url"] as? String).flatMap(URL.init(string:)) else { return nil }
-            return Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, url: page)
+            let zip = (json["assets"] as? [[String: Any]])?
+                .compactMap { $0["browser_download_url"] as? String }
+                .first { $0.hasSuffix(".zip") }
+                .flatMap(URL.init(string:))
+            return Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, url: page, zip: zip)
         }.value
     }
 
@@ -525,6 +529,26 @@ enum Updater {
         UserDefaults.standard.object(forKey: "autoInstall") as? Bool ?? true
     }
 
+    /// Scarica lo zip con HTTPS (repo pubblico); se non riesce prova con `gh`.
+    private static func download(_ r: Release, to dir: URL) -> Bool {
+        if let u = r.zip, let data = fetch(u, timeout: 120) {
+            return (try? data.write(to: dir.appendingPathComponent("Genuzzu.zip"))) != nil
+        }
+        guard let gh = ghPath() else { return false }
+        return run(gh, ["release", "download", "v\(r.version)", "-R", repo, "-p", "*.zip", "-D", dir.path]) == 0
+    }
+
+    private static func fetch(_ url: URL, timeout: TimeInterval) -> Data? {
+        let sem = DispatchSemaphore(value: 0)
+        var result: Data?
+        URLSession.shared.dataTask(with: URLRequest(url: url, timeoutInterval: timeout)) { data, resp, _ in
+            if (resp as? HTTPURLResponse)?.statusCode == 200 { result = data }
+            sem.signal()
+        }.resume()
+        sem.wait()
+        return result
+    }
+
     /// Scarica lo zip della release, lo estrae e sostituisce l'app in esecuzione.
     static func install(_ r: Release) async -> Bool {
         await Task.detached { () -> Bool in
@@ -533,9 +557,8 @@ enum Updater {
             defer { try? fm.removeItem(at: tmp) }
             let out = tmp.appendingPathComponent("x")
             guard Bundle.main.bundleURL.pathExtension == "app",
-                  let gh = ghPath(),
                   (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil,
-                  run(gh, ["release", "download", "v\(r.version)", "-R", repo, "-p", "*.zip", "-D", tmp.path]) == 0,
+                  download(r, to: tmp),
                   let zip = (try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "zip" }),
                   run("/usr/bin/ditto", ["-x", "-k", zip.path, out.path]) == 0 else { return false }
             guard let newApp = (try? fm.contentsOfDirectory(at: out, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "app" }) else { return false }
