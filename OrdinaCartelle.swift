@@ -162,9 +162,15 @@ enum Duplicates {
     private static let chunk = 1 << 20
 
     /// Gruppi di file con contenuto identico (almeno due per gruppo).
-    static func groups(_ files: [(url: URL, size: Int64)]) -> [[URL]] {
+    static func groups(_ files: [(url: URL, size: Int64)], isCancelled: () -> Bool = { false },
+                       progress: (_ done: Int, _ total: Int) -> Void = { _, _ in }) -> [[URL]] {
         var result: [[URL]] = []
-        for (_, sameSize) in Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size) where sameSize.count > 1 {
+        let candidates = Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size).filter { $0.value.count > 1 }
+        var done = 0
+        for (_, sameSize) in candidates {
+            if isCancelled() { break }
+            done += 1
+            progress(done, candidates.count)
             let distinct = withoutLinks(sameSize.map(\.url))
             guard distinct.count > 1 else { continue }
             let size = sameSize[0].size
@@ -727,6 +733,7 @@ struct ContentView: View {
     @State private var confirm = false
     @State private var dropTargeted = false
     @State private var section = 0
+    @State private var showDuplicates = false
     @AppStorage("mascotVisible") private var mascotVisible = true
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @StateObject private var search = SearchModel()
@@ -827,6 +834,9 @@ struct ContentView: View {
 
             HStack {
                 if vm.busy { ProgressView().controlSize(.small) }
+                Button { showDuplicates = true } label: { Label("Cerca duplicati", systemImage: "square.on.square") }
+                    .disabled(vm.folder == nil || vm.busy)
+                    .help("Trova i file con contenuto identico nella cartella scelta")
                 Spacer()
                 Button("Annulla ultimo ordinamento") { vm.undo() }
                     .disabled(!vm.canUndo || vm.busy)
@@ -842,6 +852,10 @@ struct ContentView: View {
             vm.setFolder(url)
             return true
         } isTargeted: { dropTargeted = $0 }
+        .sheet(isPresented: $showDuplicates, onDismiss: {
+            vm.canUndo = Organizer.loadLog() != nil
+            vm.scan()
+        }) { DuplicatesView(vm: vm) }
         .alert("Spostare \(vm.moves.count) file?", isPresented: $confirm) {
             Button("Ordina") { vm.organize() }
             Button("Cancella", role: .cancel) {}
@@ -3577,6 +3591,285 @@ struct SettingsView: View {
         .background(AmbientBackground())
         .frame(width: 520)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Cerca duplicati
+
+struct DupFile: Identifiable {
+    let url: URL
+    let size: Int64
+    let modified: Date?
+    var id: String { url.path }
+}
+
+struct DupGroup: Identifiable {
+    let id = UUID()
+    var files: [DupFile]
+    var size: Int64 { files[0].size }
+}
+
+/// Interruttore sicuro da leggere da un altro thread.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+}
+
+/// Cerca nella cartella scelta i file con contenuto esattamente identico, senza riordinare nulla.
+@MainActor
+final class DuplicateFinder: ObservableObject {
+    @Published var groups: [DupGroup] = []
+    /// I file che l'utente vuole togliere di mezzo: in ogni gruppo ne resta sempre almeno uno.
+    @Published var remove = Set<String>()
+    @Published var recursive = true
+    @Published var scanning = false
+    @Published var busy = false
+    @Published var scanned = false
+    @Published var status = ""
+    private let cancelled = CancelFlag()
+
+    var removeCount: Int { remove.count }
+    var reclaimable: Int64 { groups.flatMap(\.files).filter { remove.contains($0.id) }.reduce(0) { $0 + $1.size } }
+
+    func scan(root: URL) {
+        guard !scanning else { return }
+        scanning = true
+        scanned = false
+        cancelled.set(false)
+        groups = []
+        remove = []
+        status = "Cerco i file in “\(root.lastPathComponent)”…"
+        let rec = recursive
+        let cancelled = self.cancelled
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let keys: [URLResourceKey] = [.isRegularFileKey, .isPackageKey, .fileSizeKey, .contentModificationDateKey]
+            var options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
+            if !rec { options.insert(.skipsSubdirectoryDescendants) }
+            let skip = root.appendingPathComponent(Organizer.duplicatesFolder).standardizedFileURL.path + "/"
+            var files: [DupFile] = []
+            if let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: options) {
+                for case let url as URL in en {
+                    let v = try? url.resourceValues(forKeys: Set(keys))
+                    guard v?.isRegularFile == true, v?.isPackage != true,
+                          !Organizer.partialExts.contains(url.pathExtension.lowercased()),
+                          !url.standardizedFileURL.path.hasPrefix(skip) else { continue }
+                    files.append(DupFile(url: url, size: Int64(v?.fileSize ?? 0), modified: v?.contentModificationDate))
+                }
+            }
+            let byPath = Dictionary(files.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            await MainActor.run { self?.status = "Confronto \(files.count) file…" }
+            let found = Duplicates.groups(files.map { ($0.url, $0.size) },
+                                          isCancelled: { cancelled.isSet },
+                                          progress: { d, t in
+                Task { @MainActor in self?.status = "Confronto dei contenuti: \(d) gruppi di \(t)…" }
+            })
+            // Dentro ogni gruppo: prima il più vecchio, a parità il percorso più corto. Il primo è quello da tenere.
+            let built = found.map { g -> DupGroup in
+                let f = g.compactMap { byPath[$0.path] }.sorted {
+                    ($0.modified ?? .distantFuture, $0.id.count, $0.id) < ($1.modified ?? .distantFuture, $1.id.count, $1.id)
+                }
+                return DupGroup(files: f)
+            }.sorted { $0.size > $1.size }
+            await MainActor.run { self?.finishScan(built) }
+        }
+    }
+
+    func stop() { cancelled.set(true) }
+
+    private func finishScan(_ built: [DupGroup]) {
+        groups = built
+        remove = Set(built.flatMap { $0.files.dropFirst().map(\.id) })
+        scanning = false
+        scanned = true
+        let extra = built.reduce(0) { $0 + $1.files.count - 1 }
+        status = built.isEmpty ? (cancelled.isSet ? "Ricerca interrotta: nessun doppione trovato finora." : "Nessun doppione: tutti i file sono diversi.")
+            : "\(extra) doppioni in \(built.count) gruppi, \(ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)) recuperabili."
+    }
+
+    /// Spunta o toglie un file; in ogni gruppo almeno un file deve restare.
+    func toggle(_ file: DupFile, in group: DupGroup) {
+        if remove.contains(file.id) { remove.remove(file.id); return }
+        let kept = group.files.filter { !remove.contains($0.id) && $0.id != file.id }
+        if !kept.isEmpty { remove.insert(file.id) }
+    }
+
+    func isKept(_ file: DupFile) -> Bool { !remove.contains(file.id) }
+
+    private func dropped(_ ids: Set<String>) {
+        groups = groups.compactMap { g in
+            var g = g
+            g.files.removeAll { ids.contains($0.id) }
+            return g.files.count > 1 ? g : nil
+        }
+        remove.subtract(ids)
+    }
+
+    /// Sposta i doppioni scelti nella cartella “Duplicati” (si può annullare dal pulsante “Annulla ultimo ordinamento”).
+    func moveAside(root: URL) {
+        let chosen = groups.flatMap(\.files).filter { remove.contains($0.id) }.map(\.url)
+        guard !chosen.isEmpty else { return }
+        busy = true
+        status = "Sposto \(chosen.count) doppioni…"
+        Task.detached {
+            let dir = root.appendingPathComponent(Organizer.duplicatesFolder)
+            var used = Set<String>()
+            let moves = chosen.map { PlannedMove(source: $0, dest: Organizer.uniqueDestination(dir: dir, name: $0.lastPathComponent, used: &used)) }
+            let r = Organizer.apply(moves, root: root)
+            let gone = Set(moves.map { $0.source.path })
+            await MainActor.run {
+                self.busy = false
+                self.dropped(gone)
+                self.status = "Spostati \(r.done) doppioni in “\(Organizer.duplicatesFolder)”" + (r.failed > 0 ? ", \(r.failed) non riusciti." : ".")
+            }
+        }
+    }
+
+    /// Mette i doppioni scelti nel Cestino: si recuperano da lì.
+    func trash() {
+        let chosen = groups.flatMap(\.files).filter { remove.contains($0.id) }.map(\.url)
+        guard !chosen.isEmpty else { return }
+        busy = true
+        status = "Metto \(chosen.count) doppioni nel Cestino…"
+        Task.detached {
+            var gone = Set<String>()
+            for u in chosen where (try? FileManager.default.trashItem(at: u, resultingItemURL: nil)) != nil { gone.insert(u.path) }
+            let n = gone.count, bad = chosen.count - n
+            await MainActor.run {
+                self.busy = false
+                self.dropped(gone)
+                self.status = "\(n) doppioni nel Cestino" + (bad > 0 ? ", \(bad) non riusciti." : ".")
+            }
+        }
+    }
+}
+
+struct DuplicatesView: View {
+    @ObservedObject var vm: ViewModel
+    @StateObject private var f = DuplicateFinder()
+    @Environment(\.dismiss) private var dismiss
+    @State private var selection = Set<String>()
+    @State private var confirmTrash = false
+    @FocusState private var listFocused: Bool
+
+    private var root: URL? { vm.folder }
+    private var allURLs: [URL] { f.groups.flatMap(\.files).map(\.url) }
+    private func previewIndex() -> Int { allURLs.firstIndex { selection.contains($0.path) } ?? 0 }
+    private func preview() { QuickLook.shared.toggle(allURLs, index: previewIndex()) }
+
+    private func relative(_ url: URL) -> String {
+        guard let r = root?.path else { return url.path }
+        let p = url.deletingLastPathComponent().path
+        if p == r { return "(cartella principale)" }
+        return p.hasPrefix(r + "/") ? String(p.dropFirst(r.count + 1)) : p
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Cerca duplicati", systemImage: "square.on.square").font(.title3.weight(.semibold))
+                Spacer()
+                Toggle("Includi sottocartelle", isOn: $f.recursive).disabled(f.scanning || f.busy)
+                Button(f.scanned ? "Cerca di nuovo" : "Cerca") { if let r = root { f.scan(root: r) } }
+                    .disabled(f.scanning || f.busy || root == nil)
+            }
+            Text("Cartella: " + (root?.path ?? "nessuna"))
+                .font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            Text("Sono doppioni solo i file con contenuto esattamente identico (stessa dimensione, stessa impronta e confronto byte per byte): il nome non conta. Di ogni gruppo ne resta almeno uno.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+
+            if f.scanning {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text(f.status).font(.callout).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Ferma") { f.stop() }
+                }
+                .padding(10).glass(RoundedRectangle(cornerRadius: 14, style: .continuous), tint: .orange)
+                Spacer()
+            } else if f.groups.isEmpty {
+                ContentUnavailableView(f.scanned ? "Nessun doppione" : "Premi Cerca",
+                                       systemImage: f.scanned ? "checkmark.circle" : "magnifyingglass",
+                                       description: Text(f.scanned ? f.status : "Controllo la cartella scelta e ti mostro i file identici."))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: $selection) {
+                    ForEach(f.groups) { g in
+                        Section {
+                            ForEach(g.files) { file in row(file, in: g) }
+                        } header: {
+                            Text("\(g.files.count) copie · \(ByteCountFormatter.string(fromByteCount: g.size, countStyle: .file)) l'una")
+                        }
+                    }
+                }
+                .scrollContentBackground(.hidden)
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .focused($listFocused)
+                .onAppear { listFocused = true }
+                .onKeyPress(.space) { preview(); return .handled }
+                .onChange(of: selection) { _ in QuickLook.shared.follow(previewIndex()) }
+            }
+
+            HStack {
+                if f.busy { ProgressView().controlSize(.small) }
+                if !f.groups.isEmpty || f.busy {
+                    Text(f.groups.isEmpty ? f.status : "\(f.removeCount) da togliere · \(ByteCountFormatter.string(fromByteCount: f.reclaimable, countStyle: .file)) recuperabili")
+                        .font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Spacer()
+                Button("Chiudi") { dismiss() }
+                Button("Cestino…") { confirmTrash = true }
+                    .disabled(f.removeCount == 0 || f.busy || f.scanning)
+                Button("Sposta in “\(Organizer.duplicatesFolder)”") { if let r = root { f.moveAside(root: r) } }
+                    .prominentGlass()
+                    .disabled(f.removeCount == 0 || f.busy || f.scanning)
+            }
+        }
+        .padding()
+        .frame(minWidth: 680, minHeight: 520)
+        .background(AmbientBackground())
+        .onAppear { if let r = root, !f.scanned, !f.scanning { f.scan(root: r) } }
+        .alert("Mettere \(f.removeCount) file nel Cestino?", isPresented: $confirmTrash) {
+            Button("Metti nel Cestino", role: .destructive) { f.trash() }
+            Button("Cancella", role: .cancel) {}
+        } message: {
+            Text("Resta una copia di ogni gruppo. I file si possono recuperare dal Cestino.")
+        }
+    }
+
+    private func row(_ file: DupFile, in g: DupGroup) -> some View {
+        HStack(spacing: 12) {
+            Toggle("", isOn: Binding(get: { f.remove.contains(file.id) }, set: { _ in f.toggle(file, in: g) }))
+                .labelsHidden().help("Spunta i file da togliere")
+            FileThumbnail(url: file.url)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(file.url.lastPathComponent).font(.system(size: 14, weight: .semibold))
+                        .lineLimit(1).truncationMode(.middle)
+                    if f.isKept(file) {
+                        Text("Da tenere").font(.system(size: 10, weight: .semibold)).foregroundStyle(.green)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.green.opacity(0.16)))
+                    }
+                }
+                Text(relative(file.url)).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.head)
+            }
+            Spacer(minLength: 8)
+            if let d = file.modified {
+                Text(d.formatted(date: .abbreviated, time: .omitted)).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Button {
+                selection = [file.id]
+                QuickLook.shared.toggle(allURLs, index: allURLs.firstIndex(of: file.url) ?? 0)
+            } label: { Image(systemName: "eye") }.buttonStyle(.borderless).help("Anteprima (barra spaziatrice)")
+            Button { NSWorkspace.shared.activateFileViewerSelecting([file.url]) } label: { Image(systemName: "folder") }
+                .buttonStyle(.borderless).help("Mostra nel Finder")
+        }
+        .padding(.vertical, 4)
+        .tag(file.id)
     }
 }
 
