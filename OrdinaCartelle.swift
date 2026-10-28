@@ -840,8 +840,12 @@ final class SearchModel: ObservableObject {
         // Con la destinazione i file si scelgono per spostarli: di partenza sono tutti scelti.
         didSet { if useDestination && selection.isEmpty { selection = Set(hits.map(\.id)) } }
     }
-    /// Cartella in cui cercare; nil = tutto il computer.
-    @Published var scope: URL?
+    /// Dove cercare: ogni posto si accende da solo e si possono combinare.
+    @Published var searchComputer = true
+    @Published var searchExternal = false
+    @Published var searchNetwork = false
+    /// Cartelle aggiunte a mano.
+    @Published var folders: [URL] = []
     @Published var busy = false
     /// Cartella in cui proporre il riordino dopo una copia/spostamento riusciti.
     @Published var offerSort: URL?
@@ -880,13 +884,46 @@ final class SearchModel: ObservableObject {
         }
     }
 
-    /// Sceglie dove cercare; nil = tutto il computer.
-    func selectScope(_ url: URL?) { scope = url?.standardizedFileURL }
+    /// Le radici da leggere: disco del Mac, dischi esterni, dischi di rete e cartelle scelte a mano.
+    var searchRoots: [URL] {
+        var roots: [URL] = []
+        if searchComputer { roots.append(URL(fileURLWithPath: "/")) }
+        if searchExternal { roots += volumes.filter { !$0.network }.map(\.url) }
+        if searchNetwork { roots += volumes.filter { $0.network }.map(\.url) }
+        // Una cartella già compresa in un'altra radice non si legge due volte.
+        let base = roots
+        for f in folders {
+            let covered = base.contains { r in
+                r.path == "/" ? !f.path.hasPrefix("/Volumes") : f.path == r.path || f.path.hasPrefix(r.path + "/")
+            }
+            if !covered { roots.append(f) }
+        }
+        return roots
+    }
+
+    /// I posti scelti in una frase, per esempio “Tutto il computer · Dischi esterni · Rete”.
+    var placesSummary: String {
+        var bits: [String] = []
+        if searchComputer { bits.append("Tutto il computer") }
+        if searchExternal { bits.append("Dischi esterni") }
+        if searchNetwork { bits.append("Rete") }
+        bits += folders.map(\.lastPathComponent)
+        return bits.isEmpty ? "Nessun posto scelto" : bits.joined(separator: " · ")
+    }
+
+    func addFolder(_ url: URL) {
+        let u = url.standardizedFileURL
+        if !folders.contains(u) { folders.append(u) }
+    }
 
     /// Esclude Libreria, pacchetti .app e cartelle nascoste, a meno che si chieda di includerli.
+    /// Dischi esterni, di rete e cartelle scelte a mano non vengono mai filtrati.
     var hits: [Hit] {
-        includeSystem || scope != nil ? all : all.filter { h in
+        if includeSystem { return all }
+        let own = folders.map(\.path)
+        return all.filter { h in
             let p = h.url.path
+            if p.hasPrefix("/Volumes/") || own.contains(where: { p.hasPrefix($0 + "/") }) { return true }
             return !(p.contains("/Library/") || p.contains(".app/") || p.contains("/.") || p.hasPrefix("/System")
                      || p.hasPrefix("/usr") || p.hasPrefix("/private") || p.hasPrefix("/opt"))
         }
@@ -917,13 +954,18 @@ final class SearchModel: ObservableObject {
     func stop() { deepTask?.cancel() }
 
     private func searchDeep(words: [String]) {
-        let roots = scope.map { [$0] } ?? ([FileManager.default.homeDirectoryForCurrentUser] + volumes.map(\.url))
+        let roots = searchRoots
         let cal = Calendar.current
         let lo = cal.startOfDay(for: min(from, to))
         let hi = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: max(from, to))) ?? max(from, to)
         let dateRange = useDate ? (created: dateField == .created, lo: lo, hi: hi) : nil
         let types = useKind ? kind.utTypes : []
-        let skipLibrary = !includeSystem && scope == nil
+        let skipLibrary = !includeSystem && searchComputer
+        let includeSystem = self.includeSystem
+        // Dalla radice del Mac: i dischi collegati si leggono a parte e /System/Volumes duplicherebbe tutto.
+        var skipTop: Set<String> = ["/Volumes", "/dev", "/cores", "/Network", "/System/Volumes"]
+        if !includeSystem { skipTop.formUnion(["/System", "/private", "/usr", "/bin", "/sbin", "/opt", "/Library"]) }
+        let skipTopLevel = skipTop
         deepTask = Task.detached(priority: .userInitiated) { [weak self] in
             var batch: [Hit] = []
             var count = 0
@@ -945,7 +987,8 @@ final class SearchModel: ObservableObject {
                     if Task.isCancelled { break outer }
                     let v = try? url.resourceValues(forKeys: Set(keys))
                     if v?.isDirectory == true {
-                        if skipLibrary && url.lastPathComponent == "Library" { en.skipDescendants() }
+                        if (root.path == "/" && skipTopLevel.contains(url.path))
+                            || (skipLibrary && url.lastPathComponent == "Library") { en.skipDescendants() }
                         continue
                     }
                     count += 1
@@ -982,6 +1025,8 @@ final class SearchModel: ObservableObject {
 
     private func deepFinish() {
         guard searching else { return }
+        var seen = Set<String>()
+        all = all.filter { seen.insert($0.id).inserted }
         all.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         selection = useDestination ? Set(hits.map(\.id)) : []
         searching = false
@@ -1005,7 +1050,7 @@ final class SearchModel: ObservableObject {
 
     /// C'è almeno un criterio attivo e valido?
     var canSearch: Bool {
-        (useName && !text.trimmingCharacters(in: .whitespaces).isEmpty) || useDate || useKind
+        !searchRoots.isEmpty && ((useName && !text.trimmingCharacters(in: .whitespaces).isEmpty) || useDate || useKind)
     }
 
     /// Riassunto a parole di cosa verrà cercato, mostrato sotto il pulsante Cerca.
@@ -1019,7 +1064,7 @@ final class SearchModel: ObservableObject {
     }
     var summary: String {
         guard canSearch else { return "Scegli almeno un criterio di ricerca, poi premi Cerca." }
-        return "Cercherò file con " + criteriaBits + " — in " + (scope?.lastPathComponent ?? "tutto il computer")
+        return "Cercherò file con " + criteriaBits + " — in " + placesSummary.lowercased()
     }
 
     /// Imposta il periodo e attiva il filtro per data.
@@ -1051,7 +1096,7 @@ final class SearchModel: ObservableObject {
         p.canChooseFiles = false
         p.prompt = "Cerca qui"
         p.message = "Scegli la cartella in cui cercare"
-        if p.runModal() == .OK, let url = p.url { selectScope(url) }
+        if p.runModal() == .OK, let url = p.url { addFolder(url) }
     }
 
     func chooseDestination() {
@@ -1467,7 +1512,7 @@ struct SearchView: View {
             placeChips
             modePicker
             Toggle("Includi file di sistema e della Libreria", isOn: $m.includeSystem)
-                .disabled(m.scope != nil)
+                .disabled(!m.searchComputer)
                 .lineLimit(1)
                 .font(.callout)
         }
@@ -1490,39 +1535,32 @@ struct SearchView: View {
         .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    /// Scelte rapide: tutto il Mac, la cartella personale, i dischi esterni e quelli di rete collegati.
+    /// Dove cercare: ogni posto si accende e si spegne da solo, quindi si possono scegliere più posti insieme.
     private var placeChips: some View {
-        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL
-        let externals = m.volumes.filter { !$0.network }
-        let networks = m.volumes.filter { $0.network }
-        func volumeMenu(_ title: String, _ symbol: String, _ list: [SearchModel.Volume], empty: String) -> some View {
-            Menu {
-                ForEach(list) { v in Button(v.name) { m.selectScope(v.url) } }
-            } label: {
-                placeChip(title, symbol, selected: m.scope.map { s in list.contains { s.path.hasPrefix($0.url.path) } } ?? false)
+        let hasExternal = m.volumes.contains { !$0.network }
+        let hasNetwork = m.volumes.contains { $0.network }
+        func chip(_ title: String, _ symbol: String, _ isOn: Binding<Bool>, available: Bool = true, empty: String = "") -> some View {
+            Button { isOn.wrappedValue.toggle() } label: {
+                placeChip(title, symbol, selected: isOn.wrappedValue && available)
             }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden)
             .buttonStyle(.plain)
-            .disabled(list.isEmpty)
-            .opacity(list.isEmpty ? 0.45 : 1)
-            .help(list.isEmpty ? empty : "Scegli il disco in cui cercare")
+            .disabled(!available)
+            .opacity(available ? 1 : 0.45)
+            .help(available ? "Clicca per includere o escludere" : empty)
         }
         return LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 8)], spacing: 8) {
-            Button { m.selectScope(nil) } label: { placeChip("Tutto il computer", "desktopcomputer", selected: m.scope == nil) }
-                .buttonStyle(.plain)
-            Button { m.selectScope(home) } label: { placeChip("Cartella personale", "house", selected: m.scope == home) }
-                .buttonStyle(.plain)
-            volumeMenu("Dischi esterni", "externaldrive", externals, empty: "Nessun disco esterno collegato")
-            volumeMenu("Rete", "network", networks, empty: "Nessun disco di rete collegato: collegalo dal Finder con Vai › Connetti al server")
+            chip("Tutto il computer", "desktopcomputer", $m.searchComputer)
+            chip("Dischi esterni", "externaldrive", $m.searchExternal, available: hasExternal,
+                 empty: "Nessun disco esterno collegato")
+            chip("Rete", "network", $m.searchNetwork, available: hasNetwork,
+                 empty: "Nessun disco di rete collegato: collegalo dal Finder con Vai › Connetti al server")
         }
     }
 
     /// La ricerca legge ogni cartella: trova tutto, anche su dischi esterni e di rete, ma richiede un po' di tempo.
     private var modePicker: some View {
         Label {
-            Text(m.scope == nil
-                 ? "Cerco nella cartella personale e in tutti i dischi collegati: può richiedere qualche minuto. Puoi interrompere quando vuoi e tieni quello già trovato."
-                 : "Leggo ogni cartella, anche su dischi esterni e di rete: da alcuni secondi a qualche minuto. Puoi interrompere quando vuoi e tieni quello già trovato.")
+            Text("Leggo ogni cartella dei posti scelti, anche dischi esterni e di rete: da alcuni secondi a diversi minuti. Puoi interrompere quando vuoi e tieni quello già trovato.")
                 .font(.system(size: 11, weight: .regular)).fixedSize(horizontal: false, vertical: true)
         } icon: {
             Image(systemName: "info.circle").foregroundStyle(.secondary)
@@ -1570,9 +1608,10 @@ struct SearchView: View {
 
     private var originCard: some View {
         PlaceCard(role: "ORIGINE", symbol: "magnifyingglass", color: .blue,
-                  path: m.scope?.path ?? "Tutto il computer", placeholder: "") {
-            Button("Scegli cartella…") { m.chooseScope() }
-            if m.scope != nil { Button("Tutto il computer") { m.selectScope(nil) } }
+                  path: m.searchRoots.isEmpty ? nil : m.placesSummary, placeholder: "Scegli almeno un posto",
+                  missing: m.searchRoots.isEmpty) {
+            Button("Aggiungi cartella…") { m.chooseScope() }
+            if !m.folders.isEmpty { Button("Togli cartelle") { m.folders = [] } }
         }
     }
 
