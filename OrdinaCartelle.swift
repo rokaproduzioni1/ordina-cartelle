@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 import QuickLookUI
 import QuickLookThumbnailing
 import CryptoKit
+import AVFoundation
 
 // MARK: - Modello
 
@@ -3600,13 +3601,280 @@ struct DupFile: Identifiable {
     let url: URL
     let size: Int64
     let modified: Date?
+    /// Solo per i file simili: descrizione della qualità (risoluzione, bitrate…) e punteggio per ordinarli.
+    var detail = ""
+    var score = 0.0
     var id: String { url.path }
 }
 
 struct DupGroup: Identifiable {
     let id = UUID()
     var files: [DupFile]
+    /// Gruppo di file simili (non identici): il primo è quello di qualità migliore.
+    var similar = false
     var size: Int64 { files[0].size }
+}
+
+/// Che cosa cerca “Cerca duplicati”.
+enum DupMode: String, CaseIterable, Identifiable {
+    case exact = "Identici", photos = "Foto simili", music = "Musica simile"
+    var id: String { rawValue }
+    var noun: String { self == .exact ? "doppioni" : "file simili" }
+}
+
+// MARK: - File simili
+
+/// Trova foto visivamente uguali (ridimensionate, ricompresse, ritoccate di poco) e brani musicali
+/// che sono lo stesso pezzo in versioni diverse. In ogni gruppo il primo file è quello di qualità migliore.
+enum Similar {
+    static let photoExts: Set<String> = Organizer.photoExts.union(["png", "webp", "bmp"])
+    static let audioExts: Set<String> = ["mp3", "wav", "aac", "m4a", "flac", "aiff", "aif"]
+    static let losslessExts: Set<String> = ["flac", "wav", "aiff", "aif"]
+
+    /// Distanza massima (su 64 bit) tra le impronte visive di due foto considerate la stessa.
+    private static let maxDistance = 5
+    /// Differenza massima di proporzioni tra due foto della stessa immagine.
+    private static let maxRatioGap = 0.04
+    /// Differenza media massima di luminosità (0-255) sulle 64 zone confrontate.
+    private static let maxLumaGap = 14.0
+    /// Differenza media massima di colore (0-255) sulle 16 zone confrontate: distingue lo stesso disegno in colori diversi.
+    private static let maxColorGap = 30.0
+    /// Differenza massima di durata tra due versioni dello stesso brano, in secondi.
+    private static let maxDurationGap = 2.0
+
+    // MARK: Foto
+
+    struct PhotoInfo {
+        var file: DupFile
+        let hash: UInt64
+        let ratio: Double
+        let luma: [Double]
+        let color: [Double]
+        let pixels: Int
+    }
+
+    private static func grayGrid(_ image: CGImage, width: Int, height: Int) -> [UInt8]? {
+        var px = [UInt8](repeating: 0, count: width * height)
+        let ok = px.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: width, space: CGColorSpaceCreateDeviceGray(),
+                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+            ctx.interpolationQuality = .high
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        return ok ? px : nil
+    }
+
+    /// Colore medio (rosso, verde, blu) di una griglia 4×4.
+    private static func colorGrid(_ image: CGImage) -> [Double]? {
+        var px = [UInt8](repeating: 0, count: 4 * 4 * 4)
+        let ok = px.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: 4, height: 4, bitsPerComponent: 8, bytesPerRow: 16,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+            ctx.interpolationQuality = .high
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: 4, height: 4))
+            return true
+        }
+        guard ok else { return nil }
+        return (0..<16).flatMap { [Double(px[$0 * 4]), Double(px[$0 * 4 + 1]), Double(px[$0 * 4 + 2])] }
+    }
+
+    static func photoInfo(_ file: DupFile) -> PhotoInfo? {
+        guard let src = CGImageSourceCreateWithURL(file.url as CFURL, nil) else { return nil }
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        let w = props?[kCGImagePropertyPixelWidth] as? Int ?? 0
+        let h = props?[kCGImagePropertyPixelHeight] as? Int ?? 0
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                        kCGImageSourceCreateThumbnailWithTransform: true,
+                                        kCGImageSourceThumbnailMaxPixelSize: 96]
+        guard let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary),
+              thumb.width > 0, thumb.height > 0,
+              let diff = grayGrid(thumb, width: 9, height: 8),
+              let zones = grayGrid(thumb, width: 8, height: 8),
+              let color = colorGrid(thumb) else { return nil }
+        var hash: UInt64 = 0
+        for row in 0..<8 {
+            for col in 0..<8 {
+                hash <<= 1
+                if diff[row * 9 + col] > diff[row * 9 + col + 1] { hash |= 1 }
+            }
+        }
+        // Luminosità delle 64 zone, senza la media: un ritocco di luminosità non le fa sembrare diverse.
+        let mean = zones.reduce(0.0) { $0 + Double($1) } / Double(zones.count)
+        var f = file
+        f.detail = w > 0 && h > 0
+            ? "\(w)×\(h) · " + String(format: "%.1f", Double(w * h) / 1_000_000).replacingOccurrences(of: ".", with: ",") + " MP"
+            : ""
+        f.score = Double(w * h)
+        return PhotoInfo(file: f, hash: hash, ratio: Double(thumb.width) / Double(thumb.height),
+                         luma: zones.map { Double($0) - mean }, color: color, pixels: w * h)
+    }
+
+    private static func samePhoto(_ a: PhotoInfo, _ b: PhotoInfo) -> Bool {
+        guard (a.hash ^ b.hash).nonzeroBitCount <= maxDistance,
+              abs(a.ratio - b.ratio) / max(a.ratio, b.ratio) <= maxRatioGap else { return false }
+        var gap = 0.0
+        for i in 0..<a.luma.count { gap += abs(a.luma[i] - b.luma[i]) }
+        guard gap / Double(a.luma.count) <= maxLumaGap else { return false }
+        var tint = 0.0
+        for i in 0..<a.color.count { tint += abs(a.color[i] - b.color[i]) }
+        return tint / Double(a.color.count) <= maxColorGap
+    }
+
+    private struct UnionFind {
+        var parent: [Int]
+        init(_ n: Int) { parent = Array(0..<n) }
+        mutating func find(_ i: Int) -> Int {
+            var i = i
+            while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i] }
+            return i
+        }
+        mutating func union(_ a: Int, _ b: Int) {
+            let ra = find(a), rb = find(b)
+            if ra != rb { parent[ra] = rb }
+        }
+    }
+
+    /// Dal migliore al peggiore: più qualità, poi più peso, poi il più vecchio.
+    private static func ranked(_ files: [DupFile]) -> [DupFile] {
+        files.sorted {
+            if $0.score != $1.score { return $0.score > $1.score }
+            if $0.size != $1.size { return $0.size > $1.size }
+            return ($0.modified ?? .distantFuture, $0.id) < ($1.modified ?? .distantFuture, $1.id)
+        }
+    }
+
+    static func photoGroups(_ files: [DupFile], isCancelled: @escaping () -> Bool,
+                            progress: @escaping (_ done: Int, _ total: Int) -> Void) -> [[DupFile]] {
+        let lock = NSLock()
+        var infos: [PhotoInfo] = []
+        var done = 0
+        DispatchQueue.concurrentPerform(iterations: files.count) { i in
+            if isCancelled() { return }
+            let info = photoInfo(files[i])
+            lock.lock()
+            if let info { infos.append(info) }
+            done += 1
+            let d = done
+            lock.unlock()
+            if d % 20 == 0 || d == files.count { progress(d, files.count) }
+        }
+        guard !isCancelled(), infos.count > 1 else { return [] }
+
+        // Si confrontano solo le foto che condividono almeno una fascia dell'impronta:
+        // con 6 fasce e distanza massima 5, due foto simili ne hanno sempre una uguale.
+        var uf = UnionFind(infos.count)
+        let bands: [(shift: UInt64, bits: UInt64)] = [(0, 11), (11, 11), (22, 11), (33, 11), (44, 11), (55, 9)]
+        for band in bands {
+            if isCancelled() { return [] }
+            var buckets: [UInt64: [Int]] = [:]
+            for (i, info) in infos.enumerated() {
+                buckets[(info.hash >> band.shift) & ((1 << band.bits) - 1), default: []].append(i)
+            }
+            for idx in buckets.values where idx.count > 1 && idx.count <= 1500 {
+                for a in 0..<idx.count {
+                    for b in (a + 1)..<idx.count where uf.find(idx[a]) != uf.find(idx[b]) {
+                        if samePhoto(infos[idx[a]], infos[idx[b]]) { uf.union(idx[a], idx[b]) }
+                    }
+                }
+            }
+        }
+        var clusters: [Int: [DupFile]] = [:]
+        for i in infos.indices { clusters[uf.find(i), default: []].append(infos[i].file) }
+        return clusters.values.filter { $0.count > 1 }.map(ranked)
+    }
+
+    // MARK: Musica
+
+    struct Track {
+        var file: DupFile
+        let key: String
+        let duration: Double
+    }
+
+    private static func normalized(_ s: String) -> String {
+        let folded = s.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+        return folded.components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// Nome del file ripulito da numeri di traccia e segni di copia (“01 - Brano (1)”, “Brano copia”).
+    private static func cleanedName(_ url: URL) -> String {
+        var s = url.deletingPathExtension().lastPathComponent
+        s = s.replacingOccurrences(of: #"\s*\(\d+\)$"#, with: "", options: .regularExpression)
+        s = normalized(s)
+        s = s.replacingOccurrences(of: #"^\d{1,3}\s+"#, with: "", options: .regularExpression)
+        s = s.replacingOccurrences(of: #"\s(copia|copy)(\s\d+)?$"#, with: "", options: .regularExpression)
+        return s
+    }
+
+    static func track(_ file: DupFile) async -> Track? {
+        let asset = AVURLAsset(url: file.url)
+        guard let time = try? await asset.load(.duration), time.seconds.isFinite, time.seconds > 1 else { return nil }
+        let items = (try? await asset.load(.commonMetadata)) ?? []
+        func text(_ id: AVMetadataIdentifier) async -> String {
+            guard let item = AVMetadataItem.metadataItems(from: items, filteredByIdentifier: id).first,
+                  let v = try? await item.load(.stringValue) else { return "" }
+            return v.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let title = await text(.commonIdentifierTitle), artist = await text(.commonIdentifierArtist)
+        var rate = 0.0
+        if let t = (try? await asset.loadTracks(withMediaType: .audio))?.first {
+            rate = Double((try? await t.load(.estimatedDataRate)) ?? 0)
+        }
+        if rate <= 0 { rate = Double(file.size) * 8 / time.seconds }
+
+        let t = normalized(title), a = normalized(artist)
+        let name = cleanedName(file.url)
+        // Con titolo e artista nei tag ci si fida di quelli; altrimenti solo del nome, purché non sia troppo corto.
+        let key: String
+        if t.count >= 2 && !a.isEmpty { key = "t:\(a)|\(t)" }
+        else if name.count >= 4 { key = "f:\(name)" }
+        else { return nil }
+
+        let lossless = losslessExts.contains(file.url.pathExtension.lowercased())
+        var f = file
+        let mins = Int(time.seconds) / 60, secs = Int(time.seconds) % 60
+        f.detail = (lossless ? "senza perdita · " : "") + "\(Int(rate / 1000)) kbps · \(mins):" + String(format: "%02d", secs)
+            + (key.hasPrefix("t:") ? " · \(artist) – \(title)" : "")
+        f.score = rate / 1000 + (lossless ? 100_000 : 0)
+        return Track(file: f, key: key, duration: time.seconds)
+    }
+
+    static func musicGroups(_ files: [DupFile], isCancelled: @escaping () -> Bool,
+                            progress: @escaping (_ done: Int, _ total: Int) -> Void) async -> [[DupFile]] {
+        var tracks: [Track] = []
+        var done = 0
+        await withTaskGroup(of: Track?.self) { group in
+            var it = files.makeIterator()
+            var running = 0
+            while running < 6, let f = it.next() { group.addTask { await track(f) }; running += 1 }
+            for await t in group {
+                done += 1
+                progress(done, files.count)
+                if let t { tracks.append(t) }
+                if !isCancelled(), let f = it.next() { group.addTask { await track(f) } }
+            }
+        }
+        guard !isCancelled() else { return [] }
+        var result: [[DupFile]] = []
+        for (_, same) in Dictionary(grouping: tracks, by: \.key) where same.count > 1 {
+            // Stesso brano solo se anche la durata coincide (a meno di un paio di secondi).
+            var cluster: [Track] = []
+            func flush() {
+                if cluster.count > 1 { result.append(ranked(cluster.map(\.file))) }
+                cluster = []
+            }
+            for t in same.sorted(by: { $0.duration < $1.duration }) {
+                if let first = cluster.first, t.duration - first.duration > maxDurationGap { flush() }
+                cluster.append(t)
+            }
+            flush()
+        }
+        return result
+    }
 }
 
 /// Interruttore sicuro da leggere da un altro thread.
@@ -3624,6 +3892,7 @@ final class DuplicateFinder: ObservableObject {
     /// I file che l'utente vuole togliere di mezzo: in ogni gruppo ne resta sempre almeno uno.
     @Published var remove = Set<String>()
     @Published var recursive = true
+    @Published var mode = DupMode.exact
     @Published var scanning = false
     @Published var busy = false
     @Published var scanned = false
@@ -3642,6 +3911,7 @@ final class DuplicateFinder: ObservableObject {
         remove = []
         status = "Cerco i file in “\(root.lastPathComponent)”…"
         let rec = recursive
+        let mode = self.mode
         let cancelled = self.cancelled
         Task.detached(priority: .userInitiated) { [weak self] in
             let keys: [URLResourceKey] = [.isRegularFileKey, .isPackageKey, .fileSizeKey, .contentModificationDateKey]
@@ -3655,23 +3925,43 @@ final class DuplicateFinder: ObservableObject {
                     guard v?.isRegularFile == true, v?.isPackage != true,
                           !Organizer.partialExts.contains(url.pathExtension.lowercased()),
                           !url.standardizedFileURL.path.hasPrefix(skip) else { continue }
+                    let ext = url.pathExtension.lowercased()
+                    if mode == .photos && !Similar.photoExts.contains(ext) { continue }
+                    if mode == .music && !Similar.audioExts.contains(ext) { continue }
                     files.append(DupFile(url: url, size: Int64(v?.fileSize ?? 0), modified: v?.contentModificationDate))
                 }
             }
-            let byPath = Dictionary(files.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             await MainActor.run { self?.status = "Confronto \(files.count) file…" }
-            let found = Duplicates.groups(files.map { ($0.url, $0.size) },
-                                          isCancelled: { cancelled.isSet },
-                                          progress: { d, t in
-                Task { @MainActor in self?.status = "Confronto dei contenuti: \(d) gruppi di \(t)…" }
-            })
-            // Dentro ogni gruppo: prima il più vecchio, a parità il percorso più corto. Il primo è quello da tenere.
-            let built = found.map { g -> DupGroup in
-                let f = g.compactMap { byPath[$0.path] }.sorted {
-                    ($0.modified ?? .distantFuture, $0.id.count, $0.id) < ($1.modified ?? .distantFuture, $1.id.count, $1.id)
+            let built: [DupGroup]
+            switch mode {
+            case .exact:
+                let byPath = Dictionary(files.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                let found = Duplicates.groups(files.map { ($0.url, $0.size) },
+                                              isCancelled: { cancelled.isSet },
+                                              progress: { d, t in
+                    Task { @MainActor in self?.status = "Confronto dei contenuti: \(d) gruppi di \(t)…" }
+                })
+                // Dentro ogni gruppo: prima il più vecchio, a parità il percorso più corto. Il primo è quello da tenere.
+                built = found.map { g -> DupGroup in
+                    let f = g.compactMap { byPath[$0.path] }.sorted {
+                        ($0.modified ?? .distantFuture, $0.id.count, $0.id) < ($1.modified ?? .distantFuture, $1.id.count, $1.id)
+                    }
+                    return DupGroup(files: f)
+                }.sorted { $0.size > $1.size }
+            case .photos, .music:
+                let candidates = files.filter { $0.size > 0 }
+                let progress: (Int, Int) -> Void = { d, t in
+                    let what = mode == .photos ? "Guardo le foto" : "Ascolto i brani"
+                    Task { @MainActor in self?.status = "\(what): \(d) di \(t)…" }
                 }
-                return DupGroup(files: f)
-            }.sorted { $0.size > $1.size }
+                let found = mode == .photos
+                    ? Similar.photoGroups(candidates, isCancelled: { cancelled.isSet }, progress: progress)
+                    : await Similar.musicGroups(candidates, isCancelled: { cancelled.isSet }, progress: progress)
+                // Per primi i gruppi dove si recupera più spazio.
+                built = found.map { DupGroup(files: $0, similar: true) }.sorted {
+                    $0.files.dropFirst().reduce(0) { $0 + $1.size } > $1.files.dropFirst().reduce(0) { $0 + $1.size }
+                }
+            }
             await MainActor.run { self?.finishScan(built) }
         }
     }
@@ -3684,8 +3974,9 @@ final class DuplicateFinder: ObservableObject {
         scanning = false
         scanned = true
         let extra = built.reduce(0) { $0 + $1.files.count - 1 }
-        status = built.isEmpty ? (cancelled.isSet ? "Ricerca interrotta: nessun doppione trovato finora." : "Nessun doppione: tutti i file sono diversi.")
-            : "\(extra) doppioni in \(built.count) gruppi, \(ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)) recuperabili."
+        let none = mode == .exact ? "Nessun doppione: tutti i file sono diversi." : "Nessun file simile trovato."
+        status = built.isEmpty ? (cancelled.isSet ? "Ricerca interrotta: niente trovato finora." : none)
+            : "\(extra) \(mode.noun) in \(built.count) gruppi, \(ByteCountFormatter.string(fromByteCount: reclaimable, countStyle: .file)) recuperabili."
     }
 
     /// Spunta o toglie un file; in ogni gruppo almeno un file deve restare.
@@ -3711,7 +4002,7 @@ final class DuplicateFinder: ObservableObject {
         let chosen = groups.flatMap(\.files).filter { remove.contains($0.id) }.map(\.url)
         guard !chosen.isEmpty else { return }
         busy = true
-        status = "Sposto \(chosen.count) doppioni…"
+        status = "Sposto \(chosen.count) \(mode.noun)…"
         Task.detached {
             let dir = root.appendingPathComponent(Organizer.duplicatesFolder)
             var used = Set<String>()
@@ -3721,7 +4012,7 @@ final class DuplicateFinder: ObservableObject {
             await MainActor.run {
                 self.busy = false
                 self.dropped(gone)
-                self.status = "Spostati \(r.done) doppioni in “\(Organizer.duplicatesFolder)”" + (r.failed > 0 ? ", \(r.failed) non riusciti." : ".")
+                self.status = "Spostati \(r.done) \(self.mode.noun) in “\(Organizer.duplicatesFolder)”" + (r.failed > 0 ? ", \(r.failed) non riusciti." : ".")
             }
         }
     }
@@ -3731,7 +4022,7 @@ final class DuplicateFinder: ObservableObject {
         let chosen = groups.flatMap(\.files).filter { remove.contains($0.id) }.map(\.url)
         guard !chosen.isEmpty else { return }
         busy = true
-        status = "Metto \(chosen.count) doppioni nel Cestino…"
+        status = "Metto \(chosen.count) \(mode.noun) nel Cestino…"
         Task.detached {
             var gone = Set<String>()
             for u in chosen where (try? FileManager.default.trashItem(at: u, resultingItemURL: nil)) != nil { gone.insert(u.path) }
@@ -3739,7 +4030,7 @@ final class DuplicateFinder: ObservableObject {
             await MainActor.run {
                 self.busy = false
                 self.dropped(gone)
-                self.status = "\(n) doppioni nel Cestino" + (bad > 0 ? ", \(bad) non riusciti." : ".")
+                self.status = "\(n) \(self.mode.noun) nel Cestino" + (bad > 0 ? ", \(bad) non riusciti." : ".")
             }
         }
     }
@@ -3765,6 +4056,14 @@ struct DuplicatesView: View {
         return p.hasPrefix(r + "/") ? String(p.dropFirst(r.count + 1)) : p
     }
 
+    private var modeHelp: String {
+        switch f.mode {
+        case .exact: "Sono doppioni solo i file con contenuto esattamente identico (stessa dimensione, stessa impronta e confronto byte per byte): il nome non conta. Di ogni gruppo ne resta almeno uno."
+        case .photos: "Trova le stesse foto ridimensionate, ricompresse o ritoccate di poco. In ogni gruppo viene tenuta quella con più pixel (poi la più pesante). Scatti in sequenza quasi uguali possono finire insieme: controlla con l'anteprima prima di togliere qualcosa."
+        case .music: "Trova lo stesso brano in versioni diverse: stesso titolo e artista nei tag (o stesso nome del file) e durata uguale. In ogni gruppo viene tenuta la qualità migliore (senza perdita, poi bitrate più alto). Ascolta l'anteprima prima di togliere qualcosa."
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -3776,7 +4075,11 @@ struct DuplicatesView: View {
             }
             Text("Cartella: " + (root?.path ?? "nessuna"))
                 .font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-            Text("Sono doppioni solo i file con contenuto esattamente identico (stessa dimensione, stessa impronta e confronto byte per byte): il nome non conta. Di ogni gruppo ne resta almeno uno.")
+            Picker("", selection: $f.mode) {
+                ForEach(DupMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented).labelsHidden().disabled(f.scanning || f.busy)
+            Text(modeHelp)
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
 
             if f.scanning {
@@ -3789,9 +4092,9 @@ struct DuplicatesView: View {
                 .padding(10).glass(RoundedRectangle(cornerRadius: 14, style: .continuous), tint: .orange)
                 Spacer()
             } else if f.groups.isEmpty {
-                ContentUnavailableView(f.scanned ? "Nessun doppione" : "Premi Cerca",
+                ContentUnavailableView(f.scanned ? (f.mode == .exact ? "Nessun doppione" : "Nessun file simile") : "Premi Cerca",
                                        systemImage: f.scanned ? "checkmark.circle" : "magnifyingglass",
-                                       description: Text(f.scanned ? f.status : "Controllo la cartella scelta e ti mostro i file identici."))
+                                       description: Text(f.scanned ? f.status : "Controllo la cartella scelta e ti mostro i file \(f.mode == .exact ? "identici" : "simili")."))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(selection: $selection) {
@@ -3799,7 +4102,11 @@ struct DuplicatesView: View {
                         Section {
                             ForEach(g.files) { file in row(file, in: g) }
                         } header: {
-                            Text("\(g.files.count) copie · \(ByteCountFormatter.string(fromByteCount: g.size, countStyle: .file)) l'una")
+                            if g.similar {
+                                Text("\(g.files.count) " + (f.mode == .music ? "versioni dello stesso brano" : "foto simili"))
+                            } else {
+                                Text("\(g.files.count) copie · \(ByteCountFormatter.string(fromByteCount: g.size, countStyle: .file)) l'una")
+                            }
                         }
                     }
                 }
@@ -3831,6 +4138,10 @@ struct DuplicatesView: View {
         .frame(minWidth: 680, minHeight: 520)
         .background(AmbientBackground())
         .onAppear { if let r = root, !f.scanned, !f.scanning { f.scan(root: r) } }
+        .onChange(of: f.mode) { _ in
+            selection = []
+            if let r = root, !f.scanning { f.scan(root: r) }
+        }
         .alert("Mettere \(f.removeCount) file nel Cestino?", isPresented: $confirmTrash) {
             Button("Metti nel Cestino", role: .destructive) { f.trash() }
             Button("Cancella", role: .cancel) {}
@@ -3849,13 +4160,18 @@ struct DuplicatesView: View {
                     Text(file.url.lastPathComponent).font(.system(size: 14, weight: .semibold))
                         .lineLimit(1).truncationMode(.middle)
                     if f.isKept(file) {
-                        Text("Da tenere").font(.system(size: 10, weight: .semibold)).foregroundStyle(.green)
+                        Text(g.similar && g.files.first?.id == file.id ? "Qualità migliore" : "Da tenere").font(.system(size: 10, weight: .semibold)).foregroundStyle(.green)
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(Capsule().fill(Color.green.opacity(0.16)))
                     }
                 }
                 Text(relative(file.url)).font(.system(size: 12)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.head)
+                if !file.detail.isEmpty {
+                    Text(file.detail + " · " + ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.tail)
+                }
             }
             Spacer(minLength: 8)
             if let d = file.modified {

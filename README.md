@@ -7,6 +7,10 @@ struttura e regole configurabili dalle Impostazioni.
 Due sezioni: **Metti in ordine** (riordina una cartella) e **Cerca file** (per nome, data, tipo o una
 combinazione; legge ogni cartella, quindi trova anche i file su dischi esterni e di rete; anteprima
 con la barra spaziatrice; copia o sposta i risultati). La mascotte Genuzzu spiega come usarle.
+
+**Cerca duplicati** (in Metti in ordine) ha tre modalità: *Identici* (stesso contenuto byte per byte),
+*Foto simili* (stessa immagine ridimensionata o ricompressa: resta quella con più pixel) e *Musica simile*
+(stesso brano in versioni diverse: resta la qualità migliore). Si sceglie sempre cosa togliere dopo l'anteprima.
 Richiede macOS 14; su macOS 26 usa il Liquid Glass.
 
 ## Compilare
