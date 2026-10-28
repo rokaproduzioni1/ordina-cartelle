@@ -748,12 +748,56 @@ final class ViewModel: ObservableObject {
 
 // MARK: - Interfaccia
 
+/// Maniglia trascinabile tra due aree: il mouse ne cambia la dimensione, il doppio clic ripristina quella automatica.
+struct PaneDivider: View {
+    /// Dimensione salvata dell'area ridimensionata (0 = automatica).
+    @Binding var stored: Double
+    /// Dimensione che l'area ha adesso, da cui parte il trascinamento.
+    let current: CGFloat
+    let range: ClosedRange<CGFloat>
+    /// Maniglia orizzontale che regola un'altezza (aree una sopra l'altra).
+    var vertical = false
+    /// L'area regolata sta sotto/a destra della maniglia: trascinare verso l'alto/sinistra la ingrandisce.
+    var inverted = false
+    @State private var start: CGFloat?
+    @State private var hovering = false
+
+    var body: some View {
+        let lit = hovering || start != nil
+        Group {
+            if vertical {
+                Capsule().fill(Color.secondary.opacity(lit ? 0.6 : 0.25)).frame(width: 44, height: 4)
+                    .frame(height: 16).frame(maxWidth: .infinity)
+            } else {
+                Capsule().fill(Color.secondary.opacity(lit ? 0.6 : 0.25)).frame(width: 4, height: 44)
+                    .frame(width: 16).frame(maxHeight: .infinity)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { inside in
+            hovering = inside
+            if inside { (vertical ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).push() } else { NSCursor.pop() }
+        }
+        .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+            .onChanged { g in
+                if start == nil { start = current }
+                let delta = vertical ? g.translation.height : g.translation.width
+                stored = Double(min(max((start ?? current) + (inverted ? -delta : delta), range.lowerBound), range.upperBound))
+            }
+            .onEnded { _ in start = nil })
+        .onTapGesture(count: 2) { stored = 0 }
+        .help("Trascina per ridimensionare, doppio clic per ripristinare")
+    }
+}
+
 struct ContentView: View {
     @StateObject private var vm = ViewModel()
     @Environment(\.openWindow) private var openWindow
     @AppStorage("autoUpdateCheck") private var autoUpdateCheck = true
     @AppStorage("layoutParts") private var layoutParts = ""
     @AppStorage("layout") private var legacyLayout = ""
+    @AppStorage("sortPaneWidth") private var sortPaneWidth = 0.0
+    @AppStorage("sortPaneHeight") private var sortPaneHeight = 0.0
     @State private var confirm = false
     @State private var dropTargeted = false
     @State private var section = 0
@@ -846,16 +890,22 @@ struct ContentView: View {
                         right
                     }
                 } else if geo.size.width >= 600 {
-                    HStack(spacing: 16) {
+                    let maxLeft = max(geo.size.width - 260, 200)
+                    let left = min(max(sortPaneWidth > 0 ? CGFloat(sortPaneWidth) : 300, 180), maxLeft)
+                    HStack(spacing: 0) {
                         DropZoneView(vm: vm, targeted: dropTargeted)
-                            .frame(minWidth: 220, maxWidth: 300)
+                            .frame(width: left)
+                        PaneDivider(stored: $sortPaneWidth, current: left, range: 180...maxLeft)
                         right
                     }
                 } else {
                     // Finestra stretta: area di drop sopra, animazione/anteprima sotto.
-                    VStack(spacing: 12) {
+                    let maxTop = max(geo.size.height - 170, 110)
+                    let top = min(max(sortPaneHeight > 0 ? CGFloat(sortPaneHeight) : 165, 110), maxTop)
+                    VStack(spacing: 0) {
                         DropZoneView(vm: vm, targeted: dropTargeted)
-                            .frame(minHeight: 140, maxHeight: 190)
+                            .frame(height: top)
+                        PaneDivider(stored: $sortPaneHeight, current: top, range: 110...maxTop, vertical: true)
                         right.frame(minHeight: 160)
                     }
                 }
@@ -1547,6 +1597,8 @@ struct SearchView: View {
     @State private var editing = false
     @FocusState private var listFocused: Bool
     @AppStorage("mascotVisible") private var mascotVisible = true
+    @AppStorage("searchPaneWidth") private var searchPaneWidth = 0.0
+    @AppStorage("searchPaneHeight") private var searchPaneHeight = 0.0
 
     // Soglie di larghezza (area utile della vista) oltre le quali si passa dal layout stretto a quello largo.
     private let mediumWidth: CGFloat = 600
@@ -2087,15 +2139,20 @@ struct SearchView: View {
         VStack(alignment: .leading, spacing: 12) {
             stepsCard(medium: medium, wide: wide)
             actionsCard
+            PaneDivider(stored: $searchPaneHeight, current: searchPaneHeight > 0 ? CGFloat(searchPaneHeight) : 260,
+                        range: 160...900, vertical: true, inverted: true)
             resultsArea(medium: medium)
+                .frame(minHeight: searchPaneHeight > 0 ? CGFloat(searchPaneHeight) : nil)
         }
     }
 
     /// Finestra larga: comandi a sinistra (con Cerca sempre visibile), animazione o risultati a destra.
     private func twoColumns(width: CGFloat) -> some View {
-        let left = min(max(width * 0.52, 440), 600)
+        let maxLeft = max(width - 32 - 16 - 300, 320)
+        let left = searchPaneWidth > 0 ? min(max(CGFloat(searchPaneWidth), 320), maxLeft)
+                                       : min(max(width * 0.52, 440), 600)
         let rightWidth = width - left - 16 - 32
-        return HStack(alignment: .top, spacing: 16) {
+        return HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
                 ScrollView(.vertical) {
                     stepsCard(medium: false, wide: false)
@@ -2104,6 +2161,7 @@ struct SearchView: View {
                 actionsCard
             }
             .frame(width: left)
+            PaneDivider(stored: $searchPaneWidth, current: left, range: 320...maxLeft)
             resultsArea(medium: rightWidth >= 560)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -2241,16 +2299,21 @@ struct SidebarView: View {
     }
 
     private static func volumes() -> [Place] {
-        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeNameKey],
+        let keys: [URLResourceKey] = [.volumeNameKey, .volumeIsLocalKey, .volumeIsRootFileSystemKey]
+        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys,
                                                          options: [.skipHiddenVolumes]) ?? []
-        return urls.filter { $0.path.hasPrefix("/Volumes/") }.map {
-            let name = (try? $0.resourceValues(forKeys: [.volumeNameKey]))?.volumeName ?? $0.lastPathComponent
-            return Place(name: name, symbol: "externaldrive", url: $0)
+        return urls.compactMap {
+            guard $0.path.hasPrefix("/Volumes/"),
+                  let v = try? $0.resourceValues(forKeys: Set(keys)), v.volumeIsRootFileSystem != true else { return nil }
+            return Place(name: v.volumeName ?? $0.lastPathComponent,
+                         symbol: v.volumeIsLocal == false ? "server.rack" : "externaldrive", url: $0)
         }
     }
 
+    /// I dischi si montano e smontano mentre l'app è aperta (NAS compreso): l'elenco va riletto.
+    @State private var volumes: [Place] = SidebarView.volumes()
+
     var body: some View {
-        let volumes = Self.volumes()
         List(selection: $selection) {
             Section("Preferiti") {
                 ForEach(Self.places()) { p in
@@ -2264,6 +2327,12 @@ struct SidebarView: View {
                     }
                 }
             }
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
+            volumes = Self.volumes()
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+            volumes = Self.volumes()
         }
         .listStyle(.sidebar)
     }
