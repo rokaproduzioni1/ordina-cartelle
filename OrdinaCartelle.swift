@@ -3888,6 +3888,11 @@ final class CancelFlag: @unchecked Sendable {
 /// Cerca nella cartella scelta i file con contenuto esattamente identico, senza riordinare nulla.
 @MainActor
 final class DuplicateFinder: ObservableObject {
+    /// Unico per tutta l'app: la finestra di confronto (separata, così può andare a schermo intero) lo legge da qui.
+    static let shared = DuplicateFinder()
+    /// Gruppo mostrato nella finestra di confronto e cartella di partenza (per mostrare i percorsi).
+    @Published var compareGroup: UUID?
+    var root: URL?
     @Published var groups: [DupGroup] = []
     /// I file che l'utente vuole togliere di mezzo: in ogni gruppo ne resta sempre almeno uno.
     @Published var remove = Set<String>()
@@ -3904,6 +3909,8 @@ final class DuplicateFinder: ObservableObject {
 
     func scan(root: URL) {
         guard !scanning else { return }
+        self.root = root
+        compareGroup = nil
         scanning = true
         scanned = false
         cancelled.set(false)
@@ -4038,11 +4045,11 @@ final class DuplicateFinder: ObservableObject {
 
 struct DuplicatesView: View {
     @ObservedObject var vm: ViewModel
-    @StateObject private var f = DuplicateFinder()
+    @ObservedObject private var f = DuplicateFinder.shared
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @State private var selection = Set<String>()
     @State private var confirmTrash = false
-    @State private var compareGroup: UUID?
     @FocusState private var listFocused: Bool
 
     private var root: URL? { vm.folder }
@@ -4110,7 +4117,7 @@ struct DuplicatesView: View {
                                     Text("\(g.files.count) copie · \(ByteCountFormatter.string(fromByteCount: g.size, countStyle: .file)) l'una")
                                 }
                                 Spacer()
-                                Button { compareGroup = g.id } label: { Label("Confronta", systemImage: "rectangle.split.2x1") }
+                                Button { f.compareGroup = g.id; openWindow(id: "compare") } label: { Label("Confronta", systemImage: "rectangle.split.2x1") }
                                     .buttonStyle(.bordered).controlSize(.small).textCase(nil)
                             }
                         }
@@ -4143,10 +4150,7 @@ struct DuplicatesView: View {
         .padding()
         .frame(minWidth: 680, minHeight: 520)
         .background(AmbientBackground())
-        .onAppear { if let r = root, !f.scanned, !f.scanning { f.scan(root: r) } }
-        .sheet(isPresented: Binding(get: { compareGroup != nil }, set: { if !$0 { compareGroup = nil } })) {
-            if let id = compareGroup { CompareView(f: f, groupID: id, root: root) }
-        }
+        .onAppear { if let r = root, !f.scanning { f.scanned = false; f.mode = .exact; f.scan(root: r) } }
         .onChange(of: f.mode) { _ in
             selection = []
             if let r = root, !f.scanning { f.scan(root: r) }
@@ -4200,18 +4204,19 @@ struct DuplicatesView: View {
 
 /// Confronto affiancato: i file di un gruppo uno accanto all'altro, grandi, per decidere quale tenere.
 struct CompareView: View {
-    @ObservedObject var f: DuplicateFinder
-    @State var groupID: UUID
-    let root: URL?
+    @ObservedObject private var f = DuplicateFinder.shared
     @Environment(\.dismiss) private var dismiss
 
-    init(f: DuplicateFinder, groupID: UUID, root: URL?) {
-        self.f = f
-        _groupID = State(initialValue: groupID)
-        self.root = root
+    private var root: URL? { f.root }
+    private var groupID: UUID? {
+        get { f.compareGroup }
+        nonmutating set { f.compareGroup = newValue }
     }
 
     private static var playing: NSSound?
+    /// Ingrandimento comune a tutte le foto (1 = intera) e punto guardato (0-1), uguali per ogni foto così si confronta lo stesso dettaglio.
+    @State private var zoom: CGFloat = 1
+    @State private var focus = CGPoint(x: 0.5, y: 0.5)
 
     /// Ascolta un brano (fermando quello in corso); senza file ferma l'ascolto.
     private static func play(_ url: URL?) {
@@ -4220,7 +4225,7 @@ struct CompareView: View {
         playing?.play()
     }
 
-    private var index: Int? { f.groups.firstIndex { $0.id == groupID } }
+    private var index: Int? { f.groups.firstIndex { $0.id == f.compareGroup } }
     private var group: DupGroup? { index.map { f.groups[$0] } }
 
     private func go(_ delta: Int) {
@@ -4245,8 +4250,16 @@ struct CompareView: View {
                 Button { go(1) } label: { Image(systemName: "chevron.right") }
                     .disabled((index ?? 0) >= f.groups.count - 1).keyboardShortcut(.rightArrow, modifiers: [])
                 Spacer()
-                Text(f.mode == .exact ? "Contenuto identico byte per byte" : "Controlla bene prima di togliere")
-                    .font(.callout).foregroundStyle(.secondary)
+                Picker("Ingrandimento", selection: $zoom) {
+                    Text("Intera").tag(CGFloat(1))
+                    Text("2×").tag(CGFloat(2))
+                    Text("4×").tag(CGFloat(4))
+                    Text("8×").tag(CGFloat(8))
+                }
+                .pickerStyle(.segmented).frame(width: 220)
+                .help("Ingrandisci tutte le foto insieme: passa il mouse su una foto per guardare lo stesso punto in ognuna")
+                Button { FullScreen.toggle() } label: { Label("Schermo intero", systemImage: "arrow.up.left.and.arrow.down.right") }
+                    .help("Schermo intero (⌃⌘F)")
                 Button("Fine") { dismiss() }.keyboardShortcut(.cancelAction)
             }
             if let g = group {
@@ -4265,6 +4278,7 @@ struct CompareView: View {
         .padding()
         .frame(minWidth: 760, minHeight: 560)
         .background(AmbientBackground())
+        .background(WindowSetup())
         .onDisappear { Self.play(nil) }
     }
 
@@ -4283,9 +4297,11 @@ struct CompareView: View {
                         Button { Self.play(nil) } label: { Label("Ferma", systemImage: "stop.fill") }
                     }
                 } else {
-                    LargePreview(url: file.url)
-                        .onTapGesture { QuickLook.shared.toggle(g.files.map(\.url), index: g.files.firstIndex { $0.id == file.id } ?? 0) }
-                        .help("Clic per ingrandire a tutto schermo")
+                    LargePreview(url: file.url, zoom: zoom, focus: $focus)
+                        .onTapGesture {
+                            if zoom == 1 { QuickLook.shared.toggle(g.files.map(\.url), index: g.files.firstIndex { $0.id == file.id } ?? 0) }
+                        }
+                        .help(zoom == 1 ? "Clic per l'anteprima di sistema" : "Muovi il mouse per spostarti in tutte le foto insieme")
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -4317,35 +4333,107 @@ struct CompareView: View {
         }
         .padding(10)
         .frame(width: width, height: height)
-        .glass(RoundedRectangle(cornerRadius: 16, style: .continuous), tint: kept ? .green : .red)
+        .glass(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(kept ? Color.green : Color.red, lineWidth: 3))
     }
 }
 
-/// Anteprima grande di un file, intera (senza ritagli).
+/// Finestra di confronto: vive a parte dalla finestra principale per poter andare a schermo intero.
+struct CompareWindow: View {
+    var body: some View { CompareView() }
+}
+
+/// Schermo intero della finestra in primo piano.
+enum FullScreen {
+    @MainActor static func toggle() { (NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil) }
+}
+
+/// Permette alla finestra di andare a schermo intero (pulsante verde, menu Vista, ⌃⌘F).
+struct WindowSetup: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async {
+            guard let w = v.window else { return }
+            w.collectionBehavior.insert(.fullScreenPrimary)
+            w.collectionBehavior.remove(.fullScreenNone)
+            w.styleMask.insert(.resizable)
+        }
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {}
+}
+
+/// Anteprima grande di un file, intera (senza ritagli) o ingrandita su un punto.
 struct LargePreview: View {
     let url: URL
-    @State private var image: NSImage?
+    var zoom: CGFloat = 1
+    @Binding var focus: CGPoint
+    @State private var thumb: NSImage?
+    @State private var full: NSImage?
     private static let cache = NSCache<NSURL, NSImage>()
+    private static let fullCache: NSCache<NSURL, NSImage> = { let c = NSCache<NSURL, NSImage>(); c.countLimit = 8; return c }()
+
+    private func fit(_ img: NSImage, in box: CGSize) -> CGSize {
+        guard img.size.width > 0, img.size.height > 0, box.width > 0, box.height > 0 else { return .zero }
+        let k = min(box.width / img.size.width, box.height / img.size.height)
+        return CGSize(width: img.size.width * k, height: img.size.height * k)
+    }
+
+    private func offset(_ fitted: CGSize, in box: CGSize) -> CGSize {
+        func axis(_ f: CGFloat, _ size: CGFloat, _ box: CGFloat) -> CGFloat {
+            let room = max(0, (size - box) / 2)
+            return min(room, max(-room, (0.5 - f) * size))
+        }
+        return CGSize(width: axis(focus.x, fitted.width * zoom, box.width), height: axis(focus.y, fitted.height * zoom, box.height))
+    }
 
     var body: some View {
-        Group {
-            if let image {
-                Image(nsImage: image).resizable().scaledToFit().padding(6)
+        GeometryReader { geo in
+            if let img = (zoom > 1 ? full : nil) ?? thumb {
+                let fitted = fit(img, in: geo.size)
+                Image(nsImage: img).resizable().interpolation(.high)
+                    .frame(width: fitted.width * zoom, height: fitted.height * zoom)
+                    .offset(offset(fitted, in: geo.size))
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .clipped()
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        guard zoom > 1, case .active(let p) = phase, fitted.width > 0, fitted.height > 0 else { return }
+                        let x = (p.x - (geo.size.width - fitted.width) / 2) / fitted.width
+                        let y = (p.y - (geo.size.height - fitted.height) / 2) / fitted.height
+                        focus = CGPoint(x: min(1, max(0, x)), y: min(1, max(0, y)))
+                    }
             } else {
-                ProgressView().controlSize(.small)
+                ProgressView().controlSize(.small).frame(width: geo.size.width, height: geo.size.height)
             }
         }
         .task(id: url) {
-            if let c = Self.cache.object(forKey: url as NSURL) { image = c; return }
-            let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 900, height: 900),
+            if let c = Self.cache.object(forKey: url as NSURL) { thumb = c; return }
+            let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 1600, height: 1600),
                                                    scale: NSScreen.main?.backingScaleFactor ?? 2,
                                                    representationTypes: .thumbnail)
             if let rep = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: req) {
                 Self.cache.setObject(rep.nsImage, forKey: url as NSURL)
-                image = rep.nsImage
+                thumb = rep.nsImage
             } else {
-                image = NSWorkspace.shared.icon(forFile: url.path)
+                thumb = NSWorkspace.shared.icon(forFile: url.path)
             }
+        }
+        // Con l'ingrandimento si carica la foto a grandezza quasi piena, altrimenti i dettagli sarebbero sfocati.
+        .task(id: zoom > 1 ? url : nil) {
+            guard zoom > 1 else { return }
+            let key = url as NSURL
+            if let c = Self.fullCache.object(forKey: key) { full = c; return }
+            let u = url
+            let img: NSImage? = await Task.detached(priority: .userInitiated) {
+                guard let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+                      let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 4096] as CFDictionary) else { return nil }
+                return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+            }.value
+            if let img { Self.fullCache.setObject(img, forKey: key); full = img }
         }
     }
 }
@@ -4542,12 +4630,18 @@ struct OrdinaCartelleApp: App {
     @StateObject private var quickSearch = SearchModel()
 
     var body: some Scene {
-        WindowGroup("Genuzzu") { ContentView() }
+        WindowGroup("Genuzzu") { ContentView().background(WindowSetup()) }
             .commands {
+                CommandGroup(replacing: .toolbar) {
+                    Button("Schermo intero") { FullScreen.toggle() }
+                        .keyboardShortcut("f", modifiers: [.command, .control])
+                }
                 CommandGroup(after: .appInfo) {
                     Button("Controlla aggiornamenti…") { Task { await Updater.check(silent: false) } }
                 }
             }
+        Window("Confronto", id: "compare") { CompareWindow() }
+            .defaultSize(width: 1500, height: 940)
         Window("Impostazioni", id: "settings") { SettingsView() }
             .windowResizability(.contentSize)
         MenuBarExtra("Genuzzu", systemImage: "magnifyingglass") { MenuBarSearchView(m: quickSearch) }
