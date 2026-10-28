@@ -2321,10 +2321,10 @@ struct PreviewTreeView: View {
         let note: String?
     }
 
-    private func rows() -> [Row] {
+    private func rows(before: Bool = false) -> [Row] {
         let root = Node()
         for m in vm.moves {
-            let comps = vm.relative(m.dest).split(separator: "/").map(String.init)
+            let comps = vm.relative(before ? m.source : m.dest).split(separator: "/").map(String.init)
             var node = root
             node.count += 1
             for c in comps.dropLast() {
@@ -2343,10 +2343,12 @@ struct PreviewTreeView: View {
                 out.append(Row(id: id, depth: depth, name: name, isFolder: true, count: child.count, note: nil))
                 if !collapsed.contains(id) { walk(child, path: id, depth: depth + 1) }
             }
-            for m in node.files.sorted(by: { $0.dest.lastPathComponent.localizedStandardCompare($1.dest.lastPathComponent) == .orderedAscending }) {
+            let fileName = { (m: PlannedMove) in before ? m.source.lastPathComponent : m.dest.lastPathComponent }
+            for m in node.files.sorted(by: { fileName($0).localizedStandardCompare(fileName($1)) == .orderedAscending }) {
+                let name = fileName(m)
                 let renamed = m.dest.lastPathComponent != m.source.lastPathComponent
-                out.append(Row(id: m.id.uuidString, depth: depth, name: m.dest.lastPathComponent, isFolder: false,
-                               count: 0, note: m.duplicateOf.map { "doppione di \($0.lastPathComponent)" }
+                out.append(Row(id: m.id.uuidString, depth: depth, name: name, isFolder: false,
+                               count: 0, note: before ? nil : m.duplicateOf.map { "doppione di \($0.lastPathComponent)" }
                                    ?? (renamed ? "da \(m.source.lastPathComponent)" : nil)))
             }
         }
@@ -2356,16 +2358,24 @@ struct PreviewTreeView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Dopo il riordino la tua cartella apparirà così")
+            Text(mode == 0 ? "Prima e dopo il riordino" : "Dopo il riordino la tua cartella apparirà così")
                 .font(.headline)
                 .fixedSize(horizontal: false, vertical: true)
             Picker("Vista", selection: $mode) {
-                Text("Struttura").tag(0)
+                Text("Prima e dopo").tag(0)
+                Text("Struttura").tag(2)
                 Text("Elenco spostamenti").tag(1)
             }
-            .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 260)
+            .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 380)
 
             if mode == 0 {
+                HStack(alignment: .top, spacing: 10) {
+                    treePane("Prima", symbol: "tray.full", rows: rows(before: true))
+                    Image(systemName: "arrow.right").font(.title3.weight(.semibold)).foregroundStyle(.secondary)
+                        .frame(maxHeight: .infinity)
+                    treePane("Dopo", symbol: "checkmark.seal", rows: rows())
+                }
+            } else if mode == 2 {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(rows()) { row in rowView(row) }
@@ -2388,6 +2398,20 @@ struct PreviewTreeView: View {
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .glass(RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private func treePane(_ title: String, symbol: String, rows: [Row]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(title, systemImage: symbol).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(rows) { row in rowView(row) }
+                }
+                .padding(.vertical, 4)
+            }
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.secondary.opacity(0.07)))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
