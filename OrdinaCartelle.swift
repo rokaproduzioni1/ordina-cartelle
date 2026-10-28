@@ -1668,6 +1668,29 @@ struct SearchView: View {
         return out
     }
 
+    /// Dove si trova il file: disco (Mac, esterno o di rete) e percorso a briciole, con la cartella che lo contiene in evidenza.
+    private func location(of url: URL) -> (badge: String, symbol: String, color: Color, crumbs: String, parent: String) {
+        var path = url.deletingLastPathComponent().path
+        var badge = "Questo Mac", symbol = "desktopcomputer", color = Color.blue
+        if path.hasPrefix("/Volumes/") {
+            let parts = path.dropFirst("/Volumes/".count).split(separator: "/", omittingEmptySubsequences: true)
+            let name = parts.first.map(String.init) ?? "Disco"
+            let network = m.volumes.first { $0.url.lastPathComponent == name }?.network ?? false
+            badge = name
+            symbol = network ? "network" : "externaldrive"
+            color = network ? .purple : .teal
+            path = "/" + parts.dropFirst().joined(separator: "/")
+        } else if path.hasPrefix(NSHomeDirectory()) {
+            path = "Home" + path.dropFirst(NSHomeDirectory().count)
+        }
+        var comps = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        let parent = comps.popLast() ?? (path == "/" ? "Radice del disco" : "")
+        // Le cartelle intermedie troppo lunghe si accorciano: restano le ultime tre.
+        var prefix = comps.suffix(3).joined(separator: " › ")
+        if comps.count > 3 { prefix = "… › " + prefix }
+        return (badge, symbol, color, prefix.isEmpty ? "" : prefix + " › ", parent)
+    }
+
     /// Anteprima di tutti i risultati, partendo dal file selezionato (o dal primo).
     private func previewIndex() -> Int {
         m.hits.firstIndex { m.selection.contains($0.id) } ?? 0
@@ -1684,10 +1707,20 @@ struct SearchView: View {
                     Text(highlighted(h.name))
                         .font(.system(size: 14, weight: .semibold))
                         .lineLimit(1).truncationMode(.middle)
-                    Text(h.url.deletingLastPathComponent().path
-                            .replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                        .font(.system(size: 11, weight: .regular)).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.head)
+                    let loc = location(of: h.url)
+                    HStack(spacing: 6) {
+                        Label(loc.badge, systemImage: loc.symbol)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(loc.color)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(loc.color.opacity(0.16)))
+                            .lineLimit(1)
+                        (Text(loc.crumbs).foregroundStyle(.secondary)
+                         + Text(loc.parent).fontWeight(.semibold).foregroundStyle(.primary))
+                            .font(.system(size: 12))
+                            .lineLimit(1).truncationMode(.head)
+                    }
+                    .help(h.url.deletingLastPathComponent().path)
                 }
                 Spacer(minLength: 8)
                 VStack(alignment: .trailing, spacing: 2) {
@@ -1702,8 +1735,13 @@ struct SearchView: View {
                 }
                 .monospacedDigit()
                 .fixedSize()
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([h.url])
+                } label: { Image(systemName: "folder") }
+                    .buttonStyle(.borderless)
+                    .help("Mostra nel Finder")
             }
-            .padding(.vertical, 4)
+            .padding(.vertical, 5)
             .tag(h.id)
         }
         .scrollContentBackground(.hidden)
