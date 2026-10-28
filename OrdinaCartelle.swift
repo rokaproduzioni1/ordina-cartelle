@@ -892,8 +892,15 @@ final class SearchModel: ObservableObject {
     @Published var scanned = 0
     private var deepTask: Task<Void, Never>?
     private static let maxHits = 5000
-    /// Chiamata a ricerca conclusa (anche se interrotta): la usa la barra dei menu per aprire i risultati.
-    var onFinish: (() -> Void)?
+    /// Chiamata appena c'è il primo risultato (o a ricerca finita se non ce n'è): la usa la barra dei menu per aprire i risultati.
+    var onResults: (() -> Void)?
+    private var announced = false
+
+    private func announceResults() {
+        guard !announced else { return }
+        announced = true
+        onResults?()
+    }
 
     struct Volume: Identifiable {
         let url: URL
@@ -983,6 +990,7 @@ final class SearchModel: ObservableObject {
         all = []
         selection = []
         searching = true
+        announced = false
         scanned = 0
         status = "Ricerca in corso…"
         searchDeep(words: words)
@@ -1058,6 +1066,7 @@ final class SearchModel: ObservableObject {
         guard searching else { return }
         all.append(contentsOf: hits.prefix(max(Self.maxHits - all.count, 0)))
         scanned = n
+        if !self.hits.isEmpty { announceResults() }
         status = "Ricerca approfondita: \(n) file controllati, \(all.count) trovati" + (folder.isEmpty ? "" : " · ora in “\(folder)”")
     }
 
@@ -1070,7 +1079,7 @@ final class SearchModel: ObservableObject {
         searching = false
         let n = hits.count
         status = n == 0 ? "Nessun file trovato (controllati \(scanned))." : "\(n) file trovati su \(scanned) controllati."
-        onFinish?()
+        announceResults()
     }
 
     func clear() {
@@ -3490,7 +3499,7 @@ struct MenuBarSearchView: View {
             m.searchExternal = true
             m.searchNetwork = true
             m.refreshVolumes()
-            m.onFinish = {
+            m.onResults = {
                 openWindow(id: "menu-results")
                 NSApp.activate(ignoringOtherApps: true)
             }
@@ -3508,12 +3517,10 @@ struct MenuBarSearchView: View {
 struct MenuBarResultsView: View {
     @ObservedObject var m: SearchModel
     @State private var selection = Set<String>()
+    @FocusState private var listFocused: Bool
 
-    private func preview() {
-        let urls = m.hits.map(\.url)
-        let i = m.hits.firstIndex { selection.contains($0.id) } ?? 0
-        QuickLook.shared.toggle(urls, index: i)
-    }
+    private func previewIndex() -> Int { m.hits.firstIndex { selection.contains($0.id) } ?? 0 }
+    private func preview() { QuickLook.shared.toggle(m.hits.map(\.url), index: previewIndex()) }
 
     /// Disco e cartella che contiene il file.
     private func place(_ url: URL) -> (badge: String, symbol: String, color: Color, folder: String) {
@@ -3535,7 +3542,27 @@ struct MenuBarResultsView: View {
                 Spacer()
                 Text(m.status).font(.callout).foregroundStyle(.secondary).lineLimit(1)
             }
-            if m.hits.isEmpty {
+            if m.searching {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Ricerca ancora in corso…").font(.system(size: 13, weight: .semibold))
+                        Text("Controllati \(m.scanned) file: l'elenco si aggiorna da solo e può ancora crescere.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Ferma") { m.stop() }
+                }
+                .padding(10)
+                .glass(RoundedRectangle(cornerRadius: 14, style: .continuous), tint: .orange)
+            }
+            if m.hits.isEmpty && m.searching {
+                VStack(spacing: 8) {
+                    ProgressView()
+                    Text("Nessun risultato per ora…").foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if m.hits.isEmpty {
                 ContentUnavailableView("Nessun file trovato", systemImage: "magnifyingglass",
                                        description: Text("Prova con un altro nome o una parte più corta."))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3570,6 +3597,11 @@ struct MenuBarResultsView: View {
                             }
                         }
                         .monospacedDigit().fixedSize()
+                        Button {
+                            selection = [h.id]
+                            QuickLook.shared.toggle(m.hits.map(\.url), index: m.hits.firstIndex { $0.id == h.id } ?? 0)
+                        } label: { Image(systemName: "eye") }
+                            .buttonStyle(.borderless).help("Anteprima (barra spaziatrice)")
                         Button { NSWorkspace.shared.activateFileViewerSelecting([h.url]) } label: { Image(systemName: "folder") }
                             .buttonStyle(.borderless).help("Mostra nel Finder")
                     }
@@ -3587,7 +3619,10 @@ struct MenuBarResultsView: View {
                 } primaryAction: { ids in
                     NSWorkspace.shared.open(ids.compactMap { URL(fileURLWithPath: $0) }.first ?? URL(fileURLWithPath: "/"))
                 }
+                .focused($listFocused)
+                .onAppear { listFocused = true }
                 .onKeyPress(.space) { preview(); return .handled }
+                .onChange(of: selection) { _ in QuickLook.shared.follow(previewIndex()) }
             }
         }
         .padding()
