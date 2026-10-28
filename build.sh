@@ -22,7 +22,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleShortVersionString</key><string>$VERSION</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSDesktopFolderUsageDescription</key><string>Genuzzu cerca e mette in ordine i file nella cartella Scrivania.</string>
+<key>NSDocumentsFolderUsageDescription</key><string>Genuzzu cerca e mette in ordine i file nella cartella Documenti.</string>
+<key>NSDownloadsFolderUsageDescription</key><string>Genuzzu cerca e mette in ordine i file nella cartella Download.</string>
+<key>NSRemovableVolumesUsageDescription</key><string>Genuzzu cerca i file nei dischi esterni collegati.</string>
+<key>NSNetworkVolumesUsageDescription</key><string>Genuzzu cerca i file nei dischi di rete collegati.</string>
 </dict></plist>
 PLIST
-codesign --force --sign - "$APP"
+# Requisito di firma legato al nome dell'app e non all'impronta del file: così macOS
+# riconosce Genuzzu come la stessa app anche dopo ricompilazioni e aggiornamenti
+# e chiede il consenso alle cartelle una volta sola.
+codesign --force --sign - -r='designated => identifier "local.genuzzu"' "$APP"
 echo "Creata: $PWD/$APP"
