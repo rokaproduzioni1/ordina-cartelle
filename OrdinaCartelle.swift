@@ -3,6 +3,7 @@ import ImageIO
 import AppKit
 import UniformTypeIdentifiers
 import QuickLookUI
+import QuickLookThumbnailing
 
 // MARK: - Modello
 
@@ -791,6 +792,41 @@ enum FileKind: String, CaseIterable, Identifiable {
     }
     /// Tipi di contenuto che corrispondono a questa categoria.
     var utTypes: [UTType] { types.compactMap { UTType($0) } }
+}
+
+/// Icona di un file nei risultati: miniatura vera per le immagini, icona di sistema per gli altri.
+struct FileThumbnail: View {
+    let url: URL
+    @State private var image: NSImage?
+    private static let cache = NSCache<NSURL, NSImage>()
+
+    private var isImage: Bool { UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true }
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable().scaledToFill()
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1))
+            } else {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().frame(width: 36, height: 36)
+                    .frame(width: 40, height: 40)
+            }
+        }
+        .task(id: url) {
+            guard isImage else { return }
+            if let c = Self.cache.object(forKey: url as NSURL) { image = c; return }
+            let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 40, height: 40),
+                                                   scale: NSScreen.main?.backingScaleFactor ?? 2,
+                                                   representationTypes: .thumbnail)
+            if let rep = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: req) {
+                Self.cache.setObject(rep.nsImage, forKey: url as NSURL)
+                image = rep.nsImage
+            }
+        }
+    }
 }
 
 /// Anteprima rapida di sistema (quella del Finder con la barra spaziatrice).
@@ -1701,8 +1737,7 @@ struct SearchView: View {
     private var resultsList: some View {
         List(m.hits, selection: $m.selection) { h in
             HStack(spacing: 12) {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: h.url.path))
-                    .resizable().frame(width: 36, height: 36)
+                FileThumbnail(url: h.url)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(highlighted(h.name))
                         .font(.system(size: 14, weight: .semibold))
