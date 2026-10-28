@@ -4,6 +4,7 @@ import AppKit
 import UniformTypeIdentifiers
 import QuickLookUI
 import QuickLookThumbnailing
+import CryptoKit
 
 // MARK: - Modello
 
@@ -11,6 +12,8 @@ struct PlannedMove: Identifiable {
     let id = UUID()
     let source: URL
     let dest: URL
+    /// Se il file è un doppione esatto, l'originale che resta al suo posto.
+    var duplicateOf: URL? = nil
 }
 
 struct UndoLog: Codable {
@@ -95,6 +98,7 @@ struct Prefs: Equatable {
     var leaveUnknownInPlace = false
     var excludedExts: Set<String> = []
     var minAgeDays = 0
+    var moveDuplicates = true
 
     static var current: Prefs {
         let d = UserDefaults.standard
@@ -104,6 +108,7 @@ struct Prefs: Equatable {
         s.monthStyle = MonthStyle(rawValue: d.string(forKey: "monthStyle") ?? "") ?? .numberName
         s.leaveUnknownInPlace = d.bool(forKey: "leaveUnknownInPlace")
         s.minAgeDays = d.integer(forKey: "minAgeDays")
+        s.moveDuplicates = d.object(forKey: "moveDuplicates") as? Bool ?? true
         s.excludedExts = Set((d.string(forKey: "excludedExts") ?? "").lowercased()
             .split(whereSeparator: { $0 == "," || $0 == " " })
             .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
@@ -145,6 +150,90 @@ struct Prefs: Equatable {
 
     var examplePath: String {
         (folderComponents(year: 2026, month: 10, day: 27, type: "Immagini", ext: "jpg") + ["foto.jpg"]).joined(separator: "/")
+    }
+}
+
+// MARK: - Doppioni
+
+/// Riconosce i file davvero identici. Un file è un doppione solo se passa tutti i controlli:
+/// stessa dimensione → stessa impronta di inizio e fine → stessa impronta SHA-256 dell'intero contenuto
+/// → confronto finale byte per byte. Un file vuoto o lo stesso file (collegamento fisico) non conta mai.
+enum Duplicates {
+    private static let chunk = 1 << 20
+
+    /// Gruppi di file con contenuto identico (almeno due per gruppo).
+    static func groups(_ files: [(url: URL, size: Int64)]) -> [[URL]] {
+        var result: [[URL]] = []
+        for (_, sameSize) in Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size) where sameSize.count > 1 {
+            let distinct = withoutLinks(sameSize.map(\.url))
+            guard distinct.count > 1 else { continue }
+            let size = sameSize[0].size
+            for (_, quick) in Dictionary(grouping: distinct, by: { quickHash($0, size: size) }) where quick.count > 1 {
+                for (_, full) in Dictionary(grouping: quick, by: { fullHash($0) }) where full.count > 1 {
+                    // Conferma finale: nessun dubbio possibile sull'identità dei contenuti.
+                    var clusters: [[URL]] = []
+                    for u in full {
+                        if let i = clusters.firstIndex(where: { sameBytes($0[0], u) }) { clusters[i].append(u) }
+                        else { clusters.append([u]) }
+                    }
+                    result += clusters.filter { $0.count > 1 }
+                }
+            }
+        }
+        return result
+    }
+
+    /// Scarta i percorsi che puntano allo stesso file sul disco (collegamenti fisici).
+    private static func withoutLinks(_ urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        return urls.filter { u in
+            var st = stat()
+            guard stat(u.path, &st) == 0 else { return false }
+            return seen.insert("\(st.st_dev)-\(st.st_ino)").inserted
+        }
+    }
+
+    private static func quickHash(_ url: URL, size: Int64) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        var sha = SHA256()
+        let edge = 64 * 1024
+        guard let head = try? h.read(upToCount: edge) else { return nil }
+        sha.update(data: head)
+        if size > Int64(edge * 2) {
+            try? h.seek(toOffset: UInt64(size) - UInt64(edge))
+            if let tail = try? h.read(upToCount: edge) { sha.update(data: tail) }
+        }
+        return sha.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func fullHash(_ url: URL) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        var sha = SHA256()
+        while true {
+            let done: Bool = autoreleasepool {
+                guard let d = try? h.read(upToCount: chunk), !d.isEmpty else { return true }
+                sha.update(data: d)
+                return false
+            }
+            if done { break }
+        }
+        return sha.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func sameBytes(_ a: URL, _ b: URL) -> Bool {
+        guard let x = try? FileHandle(forReadingFrom: a), let y = try? FileHandle(forReadingFrom: b) else { return false }
+        defer { try? x.close(); try? y.close() }
+        while true {
+            let step: Bool? = autoreleasepool {
+                let dx = (try? x.read(upToCount: chunk)) ?? Data()
+                let dy = (try? y.read(upToCount: chunk)) ?? Data()
+                if dx != dy { return false }
+                return dx.isEmpty ? true : nil
+            }
+            if let r = step { return r }
+        }
     }
 }
 
@@ -204,19 +293,22 @@ enum Organizer {
         return f.date(from: s)
     }
 
+    /// Cartella (dentro quella da ordinare) dove vanno i doppioni esatti.
+    static let duplicatesFolder = "Duplicati"
+
     static func plan(root: URL, recursive: Bool, settings: Prefs) -> [PlannedMove] {
         let fm = FileManager.default
         var options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
         if !recursive { options.insert(.skipsSubdirectoryDescendants) }
-        guard let en = fm.enumerator(at: root,
-                                     includingPropertiesForKeys: [.isRegularFileKey, .isPackageKey, .contentModificationDateKey],
-                                     options: options) else { return [] }
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isPackageKey, .contentModificationDateKey, .fileSizeKey]
+        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: keys, options: options) else { return [] }
         let cal = Calendar.current
-        var used = Set<String>()
-        var moves: [PlannedMove] = []
+
+        struct Entry { let url: URL; let dir: URL; let size: Int64; let modified: Date }
+        var entries: [Entry] = []
 
         for case let url as URL in en {
-            let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .isPackageKey, .contentModificationDateKey])
+            let v = try? url.resourceValues(forKeys: Set(keys))
             guard v?.isRegularFile == true, v?.isPackage != true else { continue }
 
             let ext = url.pathExtension.lowercased()
@@ -233,11 +325,42 @@ enum Organizer {
                                                   type: cat ?? "Altro",
                                                   ext: ext)
             let dir = comps.reduce(root) { $0.appendingPathComponent($1) }
+            entries.append(Entry(url: url, dir: dir, size: Int64(v?.fileSize ?? 0),
+                                 modified: v?.contentModificationDate ?? .distantFuture))
+        }
 
-            if url.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL { continue }
+        // Doppioni esatti: di ogni gruppo resta un originale, gli altri vanno in "Duplicati".
+        let dupDir = root.appendingPathComponent(duplicatesFolder).standardizedFileURL
+        var originalOf: [String: URL] = [:]
+        if settings.moveDuplicates {
+            let byPath = Dictionary(entries.map { ($0.url.path, $0) }, uniquingKeysWith: { a, _ in a })
+            for group in Duplicates.groups(entries.map { ($0.url, $0.size) }) {
+                let ranked = group.compactMap { byPath[$0.path] }.sorted { a, b in
+                    func key(_ e: Entry) -> (Int, Int, Date, Int, String) {
+                        let inDup = e.url.deletingLastPathComponent().standardizedFileURL == dupDir
+                        let inPlace = e.url.deletingLastPathComponent().standardizedFileURL == e.dir.standardizedFileURL
+                        return (inDup ? 1 : 0, inPlace ? 0 : 1, e.modified, e.url.path.count, e.url.path)
+                    }
+                    let x = key(a), y = key(b)
+                    if x.0 != y.0 { return x.0 < y.0 }
+                    if x.1 != y.1 { return x.1 < y.1 }
+                    if x.2 != y.2 { return x.2 < y.2 }
+                    if x.3 != y.3 { return x.3 < y.3 }
+                    return x.4 < y.4
+                }
+                guard let keep = ranked.first else { continue }
+                for e in ranked.dropFirst() { originalOf[e.url.path] = keep.url }
+            }
+        }
 
-            let dest = uniqueDestination(dir: dir, name: url.lastPathComponent, used: &used)
-            moves.append(PlannedMove(source: url, dest: dest))
+        var used = Set<String>()
+        var moves: [PlannedMove] = []
+        for e in entries {
+            let original = originalOf[e.url.path]
+            let dir = original == nil ? e.dir : dupDir
+            if e.url.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL { continue }
+            let dest = uniqueDestination(dir: dir, name: e.url.lastPathComponent, used: &used)
+            moves.append(PlannedMove(source: e.url, dest: dest, duplicateOf: original))
         }
         return moves.sorted { $0.dest.path.localizedStandardCompare($1.dest.path) == .orderedAscending }
     }
@@ -534,13 +657,16 @@ final class ViewModel: ObservableObject {
         let settings = Prefs.current
         Task.detached {
             let result = Organizer.plan(root: root, recursive: rec, settings: settings)
+            let dups = result.filter { $0.duplicateOf != nil }.count
             await MainActor.run {
                 self.moves = result
                 self.busy = false
                 self.phase = result.isEmpty ? .ordered : .preview
                 self.status = result.isEmpty
                     ? "Niente da spostare: la cartella è già in ordine."
-                    : "\(result.count) file verranno spostati in \(Set(result.map { $0.dest.deletingLastPathComponent() }).count) cartelle. Nessun file è stato ancora toccato: controlla l'anteprima, poi premi “Ordina”."
+                    : "\(result.count) file verranno spostati in \(Set(result.map { $0.dest.deletingLastPathComponent() }).count) cartelle"
+                    + (dups > 0 ? ", di cui \(dups) doppioni esatti in “\(Organizer.duplicatesFolder)”" : "")
+                    + ". Nessun file è stato ancora toccato: controlla l'anteprima, poi premi “Ordina”."
             }
         }
     }
@@ -2182,7 +2308,8 @@ struct PreviewTreeView: View {
             for m in node.files.sorted(by: { $0.dest.lastPathComponent.localizedStandardCompare($1.dest.lastPathComponent) == .orderedAscending }) {
                 let renamed = m.dest.lastPathComponent != m.source.lastPathComponent
                 out.append(Row(id: m.id.uuidString, depth: depth, name: m.dest.lastPathComponent, isFolder: false,
-                               count: 0, note: renamed ? "da \(m.source.lastPathComponent)" : nil))
+                               count: 0, note: m.duplicateOf.map { "doppione di \($0.lastPathComponent)" }
+                                   ?? (renamed ? "da \(m.source.lastPathComponent)" : nil)))
             }
         }
         if !collapsed.contains("/") { walk(root, path: "", depth: 1) }
@@ -2212,6 +2339,9 @@ struct PreviewTreeView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(vm.relative(m.source)).font(.body)
                         Text("→ " + vm.relative(m.dest)).font(.caption).foregroundStyle(.secondary)
+                        if let o = m.duplicateOf {
+                            Text("Identico a " + vm.relative(o)).font(.caption).foregroundStyle(.orange)
+                        }
                     }
                 }
                 .scrollContentBackground(.hidden)
@@ -3366,6 +3496,7 @@ struct SettingsView: View {
     @AppStorage("leaveUnknownInPlace") private var leaveUnknown = false
     @AppStorage("excludedExts") private var excluded = ""
     @AppStorage("minAgeDays") private var minAgeDays = 0
+    @AppStorage("moveDuplicates") private var moveDuplicates = true
     @AppStorage("autoUpdateCheck") private var autoUpdateCheck = true
     @AppStorage("autoInstall") private var autoInstall = true
     @AppStorage("mascotVisible") private var mascotVisible = true
@@ -3424,6 +3555,11 @@ struct SettingsView: View {
                 }
                 Toggle("Lascia al loro posto i file di tipo sconosciuto", isOn: $leaveUnknown)
                 Text("I download non completati (.crdownload, .part…) e i file nascosti vengono sempre ignorati.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Doppioni") {
+                Toggle("Metti da parte i doppioni esatti", isOn: $moveDuplicates)
+                Text("Un file è un doppione solo se ha esattamente lo stesso contenuto, controllato byte per byte (non basta il nome). Ne resta uno al suo posto e gli altri vanno nella cartella “Duplicati”: non viene cancellato nulla e l'anteprima ti mostra tutto prima.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Mascotte") {
