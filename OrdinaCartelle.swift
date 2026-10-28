@@ -4042,6 +4042,7 @@ struct DuplicatesView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selection = Set<String>()
     @State private var confirmTrash = false
+    @State private var compareGroup: UUID?
     @FocusState private var listFocused: Bool
 
     private var root: URL? { vm.folder }
@@ -4102,10 +4103,15 @@ struct DuplicatesView: View {
                         Section {
                             ForEach(g.files) { file in row(file, in: g) }
                         } header: {
-                            if g.similar {
-                                Text("\(g.files.count) " + (f.mode == .music ? "versioni dello stesso brano" : "foto simili"))
-                            } else {
-                                Text("\(g.files.count) copie · \(ByteCountFormatter.string(fromByteCount: g.size, countStyle: .file)) l'una")
+                            HStack {
+                                if g.similar {
+                                    Text("\(g.files.count) " + (f.mode == .music ? "versioni dello stesso brano" : "foto simili"))
+                                } else {
+                                    Text("\(g.files.count) copie · \(ByteCountFormatter.string(fromByteCount: g.size, countStyle: .file)) l'una")
+                                }
+                                Spacer()
+                                Button { compareGroup = g.id } label: { Label("Confronta", systemImage: "rectangle.split.2x1") }
+                                    .buttonStyle(.bordered).controlSize(.small).textCase(nil)
                             }
                         }
                     }
@@ -4138,6 +4144,9 @@ struct DuplicatesView: View {
         .frame(minWidth: 680, minHeight: 520)
         .background(AmbientBackground())
         .onAppear { if let r = root, !f.scanned, !f.scanning { f.scan(root: r) } }
+        .sheet(isPresented: Binding(get: { compareGroup != nil }, set: { if !$0 { compareGroup = nil } })) {
+            if let id = compareGroup { CompareView(f: f, groupID: id, root: root) }
+        }
         .onChange(of: f.mode) { _ in
             selection = []
             if let r = root, !f.scanning { f.scan(root: r) }
@@ -4186,6 +4195,158 @@ struct DuplicatesView: View {
         }
         .padding(.vertical, 4)
         .tag(file.id)
+    }
+}
+
+/// Confronto affiancato: i file di un gruppo uno accanto all'altro, grandi, per decidere quale tenere.
+struct CompareView: View {
+    @ObservedObject var f: DuplicateFinder
+    @State var groupID: UUID
+    let root: URL?
+    @Environment(\.dismiss) private var dismiss
+
+    init(f: DuplicateFinder, groupID: UUID, root: URL?) {
+        self.f = f
+        _groupID = State(initialValue: groupID)
+        self.root = root
+    }
+
+    private static var playing: NSSound?
+
+    /// Ascolta un brano (fermando quello in corso); senza file ferma l'ascolto.
+    private static func play(_ url: URL?) {
+        playing?.stop()
+        playing = url.flatMap { NSSound(contentsOf: $0, byReference: true) }
+        playing?.play()
+    }
+
+    private var index: Int? { f.groups.firstIndex { $0.id == groupID } }
+    private var group: DupGroup? { index.map { f.groups[$0] } }
+
+    private func go(_ delta: Int) {
+        guard let i = index, f.groups.indices.contains(i + delta) else { return }
+        groupID = f.groups[i + delta].id
+    }
+
+    private func folder(_ url: URL) -> String {
+        guard let r = root?.path else { return url.deletingLastPathComponent().path }
+        let p = url.deletingLastPathComponent().path
+        if p == r { return "(cartella principale)" }
+        return p.hasPrefix(r + "/") ? String(p.dropFirst(r.count + 1)) : p
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Button { go(-1) } label: { Image(systemName: "chevron.left") }
+                    .disabled((index ?? 0) == 0).keyboardShortcut(.leftArrow, modifiers: [])
+                Text(index.map { "Gruppo \($0 + 1) di \(f.groups.count)" } ?? "")
+                    .font(.headline).frame(minWidth: 130)
+                Button { go(1) } label: { Image(systemName: "chevron.right") }
+                    .disabled((index ?? 0) >= f.groups.count - 1).keyboardShortcut(.rightArrow, modifiers: [])
+                Spacer()
+                Text(f.mode == .exact ? "Contenuto identico byte per byte" : "Controlla bene prima di togliere")
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Fine") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            if let g = group {
+                GeometryReader { geo in
+                    let w = max(250, (geo.size.width - CGFloat(g.files.count - 1) * 12) / CGFloat(g.files.count))
+                    ScrollView(.horizontal) {
+                        HStack(alignment: .top, spacing: 12) {
+                            ForEach(g.files) { card($0, in: g, width: w, height: geo.size.height - 4) }
+                        }
+                    }
+                }
+            } else {
+                ContentUnavailableView("Gruppo non più disponibile", systemImage: "checkmark.circle")
+            }
+        }
+        .padding()
+        .frame(minWidth: 760, minHeight: 560)
+        .background(AmbientBackground())
+        .onDisappear { Self.play(nil) }
+    }
+
+    private func card(_ file: DupFile, in g: DupGroup, width: CGFloat, height: CGFloat) -> some View {
+        let kept = f.isKept(file)
+        let onlyKept = kept && g.files.filter { f.isKept($0) }.count == 1
+        let isAudio = Similar.audioExts.contains(file.url.pathExtension.lowercased())
+        return VStack(alignment: .leading, spacing: 8) {
+            ZStack {
+                if isAudio {
+                    VStack(spacing: 10) {
+                        Image(nsImage: NSWorkspace.shared.icon(forFile: file.url.path)).resizable().frame(width: 96, height: 96)
+                        Button { Self.play(file.url) } label: {
+                            Label("Ascolta", systemImage: "play.fill")
+                        }
+                        Button { Self.play(nil) } label: { Label("Ferma", systemImage: "stop.fill") }
+                    }
+                } else {
+                    LargePreview(url: file.url)
+                        .onTapGesture { QuickLook.shared.toggle(g.files.map(\.url), index: g.files.firstIndex { $0.id == file.id } ?? 0) }
+                        .help("Clic per ingrandire a tutto schermo")
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
+
+            HStack(spacing: 6) {
+                Text(file.url.lastPathComponent).font(.system(size: 14, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+                if g.similar && g.files.first?.id == file.id {
+                    Text("Qualità migliore").font(.system(size: 10, weight: .semibold)).foregroundStyle(.green)
+                        .padding(.horizontal, 6).padding(.vertical, 2).background(Capsule().fill(Color.green.opacity(0.16)))
+                }
+            }
+            if !file.detail.isEmpty { Text(file.detail).font(.system(size: 13, weight: .medium)) }
+            Text(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file)
+                 + (file.modified.map { " · " + $0.formatted(date: .abbreviated, time: .omitted) } ?? ""))
+                .font(.system(size: 12)).foregroundStyle(.secondary)
+            Text(folder(file.url)).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+
+            Button { f.toggle(file, in: g) } label: {
+                Label(kept ? "Tieni (clic per togliere)" : "Da togliere (clic per tenere)",
+                      systemImage: kept ? "checkmark.circle.fill" : "trash.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+            .tint(kept ? .green : .red)
+            .buttonStyle(.borderedProminent)
+            .disabled(onlyKept)
+            .help(onlyKept ? "Almeno un file del gruppo deve restare" : "")
+        }
+        .padding(10)
+        .frame(width: width, height: height)
+        .glass(RoundedRectangle(cornerRadius: 16, style: .continuous), tint: kept ? .green : .red)
+    }
+}
+
+/// Anteprima grande di un file, intera (senza ritagli).
+struct LargePreview: View {
+    let url: URL
+    @State private var image: NSImage?
+    private static let cache = NSCache<NSURL, NSImage>()
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable().scaledToFit().padding(6)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .task(id: url) {
+            if let c = Self.cache.object(forKey: url as NSURL) { image = c; return }
+            let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 900, height: 900),
+                                                   scale: NSScreen.main?.backingScaleFactor ?? 2,
+                                                   representationTypes: .thumbnail)
+            if let rep = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: req) {
+                Self.cache.setObject(rep.nsImage, forKey: url as NSURL)
+                image = rep.nsImage
+            } else {
+                image = NSWorkspace.shared.icon(forFile: url.path)
+            }
+        }
     }
 }
 
