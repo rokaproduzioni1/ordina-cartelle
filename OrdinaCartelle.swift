@@ -960,13 +960,7 @@ struct ContentView: View {
 
             HStack {
                 if vm.busy {
-                    if let p = vm.progress {
-                        ProgressView(value: p).frame(width: 180)
-                        Text("\(Int(p * 100))%").font(.callout.weight(.semibold)).monospacedDigit()
-                            .frame(width: 42, alignment: .trailing)
-                    } else {
-                        ProgressView().controlSize(.small)
-                    }
+                    ProgressBadge(progress: vm.progress, width: 180)
                     Text(vm.progressText).font(.caption).foregroundStyle(.secondary).monospacedDigit()
                         .lineLimit(1)
                 }
@@ -1159,6 +1153,8 @@ final class SearchModel: ObservableObject {
     /// Cartelle aggiunte a mano.
     @Published var folders: [URL] = []
     @Published var busy = false
+    /// Avanzamento 0...1 di copia, spostamento e ripristino (la ricerca stessa non ha un totale noto).
+    @Published var progress: Double?
     /// Cartella in cui proporre il riordino dopo una copia/spostamento riusciti.
     @Published var offerSort: URL?
     @Published var status = "Scrivi una parte del nome dei file e premi Invio."
@@ -1439,22 +1435,33 @@ final class SearchModel: ObservableObject {
         let items = selectedHits.map(\.url).filter { $0.deletingLastPathComponent().standardizedFileURL != dest }
         guard !items.isEmpty else { status = "Niente da fare: i file selezionati sono già in quella cartella."; return }
         busy = true
+        progress = 0
+        let verb = move ? "Spostati" : "Copiati"
         status = move ? "Spostamento in corso…" : "Copia in corso…"
+        let report = throttled { d, t in
+            Task { @MainActor in
+                guard self.busy else { return }
+                self.progress = Double(d) / Double(max(t, 1))
+                self.status = "\(verb) \(d) di \(t) file"
+            }
+        }
         Task.detached {
             let fm = FileManager.default
             var used = Set<String>()
             var done: [(from: URL, to: URL)] = []
             var failed = 0
-            for src in items {
+            for (i, src) in items.enumerated() {
                 let target = Organizer.uniqueDestination(dir: dest, name: src.lastPathComponent, used: &used)
                 do {
                     if move { try fm.moveItem(at: src, to: target) } else { try fm.copyItem(at: src, to: target) }
                     done.append((src, target))
                 } catch { failed += 1 }
+                report(i + 1, items.count)
             }
             let result = done, bad = failed
             await MainActor.run {
                 self.busy = false
+                self.progress = nil
                 self.lastMoved = move ? result : []
                 if move {
                     let gone = Set(result.map { $0.from.path })
@@ -1471,11 +1478,20 @@ final class SearchModel: ObservableObject {
     func undoMove() {
         let pairs = lastMoved
         busy = true
+        progress = 0
+        let report = throttled { d, t in
+            Task { @MainActor in
+                guard self.busy else { return }
+                self.progress = Double(d) / Double(max(t, 1))
+                self.status = "Ripristinati \(d) di \(t) file"
+            }
+        }
         Task.detached {
             let fm = FileManager.default
             var restored: [Hit] = []
             var failed = 0
-            for (from, to) in pairs.reversed() {
+            for (i, (from, to)) in pairs.reversed().enumerated() {
+                defer { report(i + 1, pairs.count) }
                 guard fm.fileExists(atPath: to.path), !fm.fileExists(atPath: from.path) else { failed += 1; continue }
                 do { try fm.moveItem(at: to, to: from); restored.append(Hit(url: from, size: nil, date: nil)) }
                 catch { failed += 1 }
@@ -1483,6 +1499,7 @@ final class SearchModel: ObservableObject {
             let back = restored, bad = failed
             await MainActor.run {
                 self.busy = false
+                self.progress = nil
                 self.lastMoved = []
                 self.all.append(contentsOf: back)
                 self.all.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -2096,7 +2113,7 @@ struct SearchView: View {
             } else if !m.hits.isEmpty {
                 Text(m.status).foregroundStyle(.secondary).font(.callout).lineLimit(2)
             }
-            if m.busy { ProgressView().controlSize(.small) }
+            if m.busy { ProgressBadge(progress: m.progress) }
         }
         let buttons = HStack {
             if !m.lastMoved.isEmpty {
@@ -4055,6 +4072,34 @@ enum Similar {
     }
 }
 
+/// Limita gli aggiornamenti dell'interfaccia (~12 al secondo); l'ultimo passo arriva sempre.
+func throttled(_ f: @escaping (_ done: Int, _ total: Int) -> Void) -> (Int, Int) -> Void {
+    var last = Date.distantPast
+    return { d, t in
+        let now = Date()
+        guard d >= t || now.timeIntervalSince(last) > 0.08 else { return }
+        last = now
+        f(d, t)
+    }
+}
+
+/// Barra con percentuale; senza valore (durata ignota) resta il cerchio che gira.
+struct ProgressBadge: View {
+    let progress: Double?
+    var width: CGFloat = 160
+    var body: some View {
+        if let p = progress {
+            HStack(spacing: 6) {
+                ProgressView(value: min(max(p, 0), 1)).frame(width: width)
+                Text("\(Int(p * 100))%").font(.callout.weight(.semibold)).monospacedDigit()
+                    .frame(width: 42, alignment: .trailing)
+            }
+        } else {
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+
 /// Interruttore sicuro da leggere da un altro thread.
 final class CancelFlag: @unchecked Sendable {
     private let lock = NSLock()
@@ -4078,6 +4123,8 @@ final class DuplicateFinder: ObservableObject {
     @Published var mode = DupMode.exact
     @Published var scanning = false
     @Published var busy = false
+    /// 0...1 quando il lavoro ha una fine prevedibile (confronto, spostamento); nil mentre si cercano i file.
+    @Published var progress: Double?
     @Published var scanned = false
     @Published var status = ""
     private let cancelled = CancelFlag()
@@ -4094,6 +4141,7 @@ final class DuplicateFinder: ObservableObject {
         cancelled.set(false)
         groups = []
         remove = []
+        progress = nil
         status = "Cerco i file in “\(root.lastPathComponent)”…"
         let rec = recursive
         let mode = self.mode
@@ -4104,8 +4152,14 @@ final class DuplicateFinder: ObservableObject {
             if !rec { options.insert(.skipsSubdirectoryDescendants) }
             let skip = root.appendingPathComponent(Organizer.duplicatesFolder).standardizedFileURL.path + "/"
             var files: [DupFile] = []
+            var lastTick = Date.distantPast
             if let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: options) {
                 for case let url as URL in en {
+                    if Date().timeIntervalSince(lastTick) > 0.15 {
+                        lastTick = Date()
+                        let n = files.count
+                        Task { @MainActor in self?.status = "Cerco i file: \(n) trovati…" }
+                    }
                     let v = try? url.resourceValues(forKeys: Set(keys))
                     guard v?.isRegularFile == true, v?.isPackage != true,
                           !Organizer.partialExts.contains(url.pathExtension.lowercased()),
@@ -4123,8 +4177,12 @@ final class DuplicateFinder: ObservableObject {
                 let byPath = Dictionary(files.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
                 let found = Duplicates.groups(files.map { ($0.url, $0.size) },
                                               isCancelled: { cancelled.isSet },
-                                              progress: { d, t in
-                    Task { @MainActor in self?.status = "Confronto dei contenuti: \(d) gruppi di \(t)…" }
+                                              progress: throttled { d, t in
+                    Task { @MainActor in
+                        guard self?.scanning == true else { return }
+                        self?.progress = Double(d) / Double(max(t, 1))
+                        self?.status = "Confronto dei contenuti: \(d) gruppi di \(t)…"
+                    }
                 })
                 // Dentro ogni gruppo: prima il più vecchio, a parità il percorso più corto. Il primo è quello da tenere.
                 built = found.map { g -> DupGroup in
@@ -4135,9 +4193,13 @@ final class DuplicateFinder: ObservableObject {
                 }.sorted { $0.size > $1.size }
             case .photos, .music:
                 let candidates = files.filter { $0.size > 0 }
-                let progress: (Int, Int) -> Void = { d, t in
+                let progress: (Int, Int) -> Void = throttled { d, t in
                     let what = mode == .photos ? "Guardo le foto" : "Ascolto i brani"
-                    Task { @MainActor in self?.status = "\(what): \(d) di \(t)…" }
+                    Task { @MainActor in
+                        guard self?.scanning == true else { return }
+                        self?.progress = Double(d) / Double(max(t, 1))
+                        self?.status = "\(what): \(d) di \(t)…"
+                    }
                 }
                 let found = mode == .photos
                     ? Similar.photoGroups(candidates, isCancelled: { cancelled.isSet }, progress: progress)
@@ -4154,6 +4216,7 @@ final class DuplicateFinder: ObservableObject {
     func stop() { cancelled.set(true) }
 
     private func finishScan(_ built: [DupGroup]) {
+        progress = nil
         groups = built
         remove = Set(built.flatMap { $0.files.dropFirst().map(\.id) })
         scanning = false
@@ -4187,15 +4250,24 @@ final class DuplicateFinder: ObservableObject {
         let chosen = groups.flatMap(\.files).filter { remove.contains($0.id) }.map(\.url)
         guard !chosen.isEmpty else { return }
         busy = true
+        progress = 0
         status = "Sposto \(chosen.count) \(mode.noun)…"
+        let report = throttled { d, t in
+            Task { @MainActor in
+                guard self.busy else { return }
+                self.progress = Double(d) / Double(max(t, 1))
+                self.status = "Sposto \(d) di \(t)…"
+            }
+        }
         Task.detached {
             let dir = root.appendingPathComponent(Organizer.duplicatesFolder)
             var used = Set<String>()
             let moves = chosen.map { PlannedMove(source: $0, dest: Organizer.uniqueDestination(dir: dir, name: $0.lastPathComponent, used: &used)) }
-            let r = Organizer.apply(moves, root: root)
+            let r = Organizer.apply(moves, root: root, progress: report)
             let gone = Set(moves.map { $0.source.path })
             await MainActor.run {
                 self.busy = false
+                self.progress = nil
                 self.dropped(gone)
                 self.status = "Spostati \(r.done) \(self.mode.noun) in “\(Organizer.duplicatesFolder)”" + (r.failed > 0 ? ", \(r.failed) non riusciti." : ".")
             }
@@ -4207,13 +4279,25 @@ final class DuplicateFinder: ObservableObject {
         let chosen = groups.flatMap(\.files).filter { remove.contains($0.id) }.map(\.url)
         guard !chosen.isEmpty else { return }
         busy = true
+        progress = 0
         status = "Metto \(chosen.count) \(mode.noun) nel Cestino…"
+        let report = throttled { d, t in
+            Task { @MainActor in
+                guard self.busy else { return }
+                self.progress = Double(d) / Double(max(t, 1))
+                self.status = "Cestino: \(d) di \(t)…"
+            }
+        }
         Task.detached {
             var gone = Set<String>()
-            for u in chosen where (try? FileManager.default.trashItem(at: u, resultingItemURL: nil)) != nil { gone.insert(u.path) }
+            for (i, u) in chosen.enumerated() {
+                if (try? FileManager.default.trashItem(at: u, resultingItemURL: nil)) != nil { gone.insert(u.path) }
+                report(i + 1, chosen.count)
+            }
             let n = gone.count, bad = chosen.count - n
             await MainActor.run {
                 self.busy = false
+                self.progress = nil
                 self.dropped(gone)
                 self.status = "\(n) \(self.mode.noun) nel Cestino" + (bad > 0 ? ", \(bad) non riusciti." : ".")
             }
@@ -4270,7 +4354,7 @@ struct DuplicatesView: View {
 
             if f.scanning {
                 HStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
+                    ProgressBadge(progress: f.progress, width: 140)
                     Text(f.status).font(.callout).foregroundStyle(.secondary)
                     Spacer()
                     Button("Ferma") { f.stop() }
@@ -4311,7 +4395,7 @@ struct DuplicatesView: View {
             }
 
             HStack {
-                if f.busy { ProgressView().controlSize(.small) }
+                if f.busy { ProgressBadge(progress: f.progress) }
                 if !f.groups.isEmpty || f.busy {
                     Text(f.groups.isEmpty ? f.status : "\(f.removeCount) da togliere · \(ByteCountFormatter.string(fromByteCount: f.reclaimable, countStyle: .file)) recuperabili")
                         .font(.callout).foregroundStyle(.secondary).lineLimit(2)
