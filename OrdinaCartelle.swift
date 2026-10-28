@@ -838,7 +838,14 @@ struct ContentView: View {
                 }
                 .transition(.opacity)
 
-                if geo.size.width >= 600 {
+                if !vm.moves.isEmpty {
+                    // Riordino proposto: l'area di drop non serve più, tutto lo spazio va all'anteprima.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(vm.status).font(.callout).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        right
+                    }
+                } else if geo.size.width >= 600 {
                     HStack(spacing: 16) {
                         DropZoneView(vm: vm, targeted: dropTargeted)
                             .frame(minWidth: 220, maxWidth: 300)
