@@ -154,40 +154,167 @@ struct Prefs: Equatable {
     }
 }
 
+// MARK: - Modifiche ai file fatte dall'app
+
+/// Contatore delle modifiche (spostamenti, copie, ripristini, Cestino): l'indice della ricerca è valido solo se non ne sono avvenute dopo.
+enum FileChanges {
+    private static let lock = NSLock()
+    private static var count = 0
+    static var generation: Int { lock.lock(); defer { lock.unlock() }; return count }
+    static func didChange() { lock.lock(); count += 1; lock.unlock() }
+}
+
+// MARK: - Parallelismo
+
+/// Quanti percorsi leggere insieme. Un NAS passa il tempo ad aspettare la risposta: più richieste insieme lo
+/// riempiono meglio. Un disco meccanico si rallenta se la testina salta avanti e indietro: pochi percorsi.
+enum Lanes {
+    static func count(for url: URL) -> Int {
+        let v = try? url.resourceValues(forKeys: [.volumeIsLocalKey, .volumeIsInternalKey])
+        if v?.volumeIsLocal == false { return 4 }
+        if v?.volumeIsInternal == false { return 2 }
+        return max(2, min(ProcessInfo.processInfo.activeProcessorCount, 8))
+    }
+
+    /// Esegue `body` per ogni indice da 0 a count-1 usando al massimo `lanes` thread.
+    static func parallelFor(_ count: Int, lanes: Int, _ body: (Int) -> Void) {
+        guard count > 0 else { return }
+        let n = max(1, min(lanes, count))
+        if n == 1 { for i in 0..<count { body(i) }; return }
+        let lock = NSLock()
+        var next = 0
+        DispatchQueue.concurrentPerform(iterations: n) { _ in
+            while true {
+                lock.lock(); let i = next; next += 1; lock.unlock()
+                if i >= count { return }
+                body(i)
+            }
+        }
+    }
+}
+
+/// Coda di cartelle da leggere, condivisa tra più thread: chi finisce una cartella ne aggiunge le sottocartelle.
+final class DirQueue: @unchecked Sendable {
+    private let cond = NSCondition()
+    private var stack: [URL]
+    private var active = 0
+    init(_ roots: [URL]) { stack = roots }
+
+    /// La prossima cartella da leggere; nil quando non ce ne sono più e nessun altro ne può aggiungere.
+    func next() -> URL? {
+        cond.lock(); defer { cond.unlock() }
+        while true {
+            if let u = stack.popLast() { active += 1; return u }
+            if active == 0 { cond.broadcast(); return nil }
+            cond.wait()
+        }
+    }
+
+    func done(adding more: [URL]) {
+        cond.lock()
+        stack += more
+        active -= 1
+        cond.broadcast()
+        cond.unlock()
+    }
+
+    /// Svuota la coda (ricerca interrotta).
+    func abort() {
+        cond.lock()
+        stack = []
+        cond.broadcast()
+        cond.unlock()
+    }
+}
+
+/// Raccoglie i risultati della ricerca da più thread e li consegna a blocchi (ogni 200 o ogni 0,4 secondi).
+final class SearchSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var batch: [Hit] = []
+    private var count = 0
+    private var last = Date()
+    private var index: [SearchModel.IndexedFile]?
+    private let limit: Int
+    private let emit: ([Hit], Int, String) -> Void
+
+    init(keepIndex: Bool, limit: Int, emit: @escaping ([Hit], Int, String) -> Void) {
+        index = keepIndex ? [] : nil
+        self.limit = limit
+        self.emit = emit
+    }
+
+    func add(hits: [Hit], files: [SearchModel.IndexedFile], folder: String) {
+        lock.lock()
+        count += files.count
+        batch += hits
+        if index != nil {
+            if index!.count + files.count > limit { index = nil } else { index!.append(contentsOf: files) }
+        }
+        var out: ([Hit], Int)?
+        if batch.count >= 200 || Date().timeIntervalSince(last) > 0.4 {
+            out = (batch, count)
+            batch = []
+            last = Date()
+        }
+        lock.unlock()
+        if let (h, n) = out { emit(h, n, folder) }
+    }
+
+    /// Quello che resta da consegnare; l'indice è nil se i file erano troppi per tenerlo in memoria.
+    func finish() -> (hits: [Hit], scanned: Int, index: [SearchModel.IndexedFile]?) {
+        lock.lock(); defer { lock.unlock() }
+        return (batch, count, index)
+    }
+}
+
 // MARK: - Doppioni
 
 /// Riconosce i file davvero identici. Un file è un doppione solo se passa tutti i controlli:
 /// stessa dimensione → stessa impronta di inizio e fine → stessa impronta SHA-256 dell'intero contenuto
 /// → confronto finale byte per byte. Un file vuoto o lo stesso file (collegamento fisico) non conta mai.
 enum Duplicates {
-    private static let chunk = 1 << 20
+    private static let chunk = 4 << 20
 
-    /// Gruppi di file con contenuto identico (almeno due per gruppo).
-    static func groups(_ files: [(url: URL, size: Int64)], isCancelled: () -> Bool = { false },
+    /// Gruppi di file con contenuto identico (almeno due per gruppo). `lanes` = quanti gruppi di dimensione
+    /// confrontare insieme (vedi `Lanes`).
+    static func groups(_ files: [(url: URL, size: Int64)], lanes: Int = 1, isCancelled: () -> Bool = { false },
                        progress: (_ done: Int, _ total: Int) -> Void = { _, _ in }) -> [[URL]] {
+        let candidates = Array(Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size).filter { $0.value.count > 1 }.values)
+        let lock = NSLock()
         var result: [[URL]] = []
-        let candidates = Dictionary(grouping: files.filter { $0.size > 0 }, by: \.size).filter { $0.value.count > 1 }
         var done = 0
-        for (_, sameSize) in candidates {
-            if isCancelled() { break }
+        Lanes.parallelFor(candidates.count, lanes: lanes) { i in
+            if isCancelled() { return }
+            let found = confirmed(candidates[i])
+            lock.lock()
+            result += found
             done += 1
             progress(done, candidates.count)
-            let distinct = withoutLinks(sameSize.map(\.url))
-            guard distinct.count > 1 else { continue }
-            let size = sameSize[0].size
-            for (_, quick) in Dictionary(grouping: distinct, by: { quickHash($0, size: size) }) where quick.count > 1 {
-                for (_, full) in Dictionary(grouping: quick, by: { fullHash($0) }) where full.count > 1 {
-                    // Conferma finale: nessun dubbio possibile sull'identità dei contenuti.
-                    var clusters: [[URL]] = []
-                    for u in full {
-                        if let i = clusters.firstIndex(where: { sameBytes($0[0], u) }) { clusters[i].append(u) }
-                        else { clusters.append([u]) }
-                    }
-                    result += clusters.filter { $0.count > 1 }
-                }
-            }
+            lock.unlock()
         }
         return result
+    }
+
+    /// I gruppi davvero identici tra file della stessa dimensione.
+    private static func confirmed(_ sameSize: [(url: URL, size: Int64)]) -> [[URL]] {
+        let distinct = withoutLinks(sameSize.map(\.url))
+        guard distinct.count > 1 else { return [] }
+        let size = sameSize[0].size
+        var out: [[URL]] = []
+        for (_, quick) in Dictionary(grouping: distinct, by: { quickHash($0, size: size) }) where quick.count > 1 {
+            // Con due soli candidati il confronto diretto basta: si ferma al primo byte diverso e legge ogni file una volta sola.
+            let sets = quick.count == 2 ? [quick] : Array(Dictionary(grouping: quick, by: { fullHash($0) }).values)
+            for full in sets where full.count > 1 {
+                // Conferma finale: nessun dubbio possibile sull'identità dei contenuti.
+                var clusters: [[URL]] = []
+                for u in full {
+                    if let i = clusters.firstIndex(where: { sameBytes($0[0], u) }) { clusters[i].append(u) }
+                    else { clusters.append([u]) }
+                }
+                out += clusters.filter { $0.count > 1 }
+            }
+        }
+        return out
     }
 
     /// Scarta i percorsi che puntano allo stesso file sul disco (collegamenti fisici).
@@ -279,7 +406,11 @@ enum Organizer {
 
     static func date(for url: URL, source: DateSource) -> Date {
         let v = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
-        let created = v?.creationDate, modified = v?.contentModificationDate
+        return date(for: url, source: source, created: v?.creationDate, modified: v?.contentModificationDate)
+    }
+
+    /// Come sopra, con le date già lette: su un NAS ogni lettura in più è una richiesta di rete.
+    static func date(for url: URL, source: DateSource, created: Date?, modified: Date?) -> Date {
         switch source {
         case .exifThenCreation:
             if photoExts.contains(url.pathExtension.lowercased()), let d = exifDate(url) { return d }
@@ -308,14 +439,17 @@ enum Organizer {
         let fm = FileManager.default
         var options: FileManager.DirectoryEnumerationOptions = [.skipsHiddenFiles, .skipsPackageDescendants]
         if !recursive { options.insert(.skipsSubdirectoryDescendants) }
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isPackageKey, .contentModificationDateKey, .fileSizeKey]
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isPackageKey, .contentModificationDateKey,
+                                      .creationDateKey, .fileSizeKey]
         guard let en = fm.enumerator(at: root, includingPropertiesForKeys: keys, options: options) else { return [] }
         let cal = Calendar.current
 
+        struct Found { let url: URL; let ext: String; let cat: String?; let size: Int64; let created: Date?; let modified: Date? }
         struct Entry { let url: URL; let dir: URL; let size: Int64; let modified: Date }
-        var entries: [Entry] = []
+        var found: [Found] = []
         var scanned = 0
 
+        // 1. Elenco dei file (gli attributi arrivano già con l'elenco: nessuna richiesta in più per file).
         for case let url as URL in en {
             let v = try? url.resourceValues(forKeys: Set(keys))
             guard v?.isRegularFile == true, v?.isPackage != true else { continue }
@@ -328,16 +462,41 @@ enum Organizer {
                Date().timeIntervalSince(m) < Double(settings.minAgeDays) * 86400 { continue }
             let cat = category(for: url)
             if cat == nil && settings.leaveUnknownInPlace { continue }
+            found.append(Found(url: url, ext: ext, cat: cat, size: Int64(v?.fileSize ?? 0),
+                               created: v?.creationDate, modified: v?.contentModificationDate))
+        }
 
-            let d = date(for: url, source: settings.dateSource)
+        // 2. Date: quella EXIF richiede di aprire ogni foto, quindi si leggono più foto insieme.
+        var dates = [Date](repeating: Date(), count: found.count)
+        let needsExif = settings.dateSource == .exifThenCreation
+        let lanes = needsExif ? Lanes.count(for: root) : 1
+        let lock = NSLock()
+        var read = 0
+        Lanes.parallelFor(found.count, lanes: lanes) { i in
+            let f = found[i]
+            let d: Date
+            if needsExif, photoExts.contains(f.ext), let x = exifDate(f.url) { d = x }
+            else { d = date(for: f.url, source: settings.dateSource, created: f.created, modified: f.modified) }
+            lock.lock()
+            dates[i] = d
+            read += 1
+            if needsExif, read % 25 == 0 || read == found.count {
+                report?("Lettura date: \(read) di \(found.count)", Double(read) / Double(max(found.count, 1)))
+            }
+            lock.unlock()
+        }
+
+        var entries: [Entry] = []
+        entries.reserveCapacity(found.count)
+        for (i, f) in found.enumerated() {
+            let d = dates[i]
             let comps = settings.folderComponents(year: cal.component(.year, from: d),
                                                   month: cal.component(.month, from: d),
                                                   day: cal.component(.day, from: d),
-                                                  type: cat ?? "Altro",
-                                                  ext: ext)
+                                                  type: f.cat ?? "Altro",
+                                                  ext: f.ext)
             let dir = comps.reduce(root) { $0.appendingPathComponent($1) }
-            entries.append(Entry(url: url, dir: dir, size: Int64(v?.fileSize ?? 0),
-                                 modified: v?.contentModificationDate ?? .distantFuture))
+            entries.append(Entry(url: f.url, dir: dir, size: f.size, modified: f.modified ?? .distantFuture))
         }
 
         // Doppioni esatti: di ogni gruppo resta un originale, gli altri vanno in "Duplicati".
@@ -345,7 +504,7 @@ enum Organizer {
         var originalOf: [String: URL] = [:]
         if settings.moveDuplicates {
             let byPath = Dictionary(entries.map { ($0.url.path, $0) }, uniquingKeysWith: { a, _ in a })
-            for group in Duplicates.groups(entries.map { ($0.url, $0.size) }, progress: { d, t in
+            for group in Duplicates.groups(entries.map { ($0.url, $0.size) }, lanes: Lanes.count(for: root), progress: { d, t in
                 report?("Ricerca doppioni: \(d) di \(t) gruppi", Double(d) / Double(max(t, 1)))
             }) {
                 let ranked = group.compactMap { byPath[$0.path] }.sorted { a, b in
@@ -367,24 +526,48 @@ enum Organizer {
         }
 
         var used = Set<String>()
+        let listing = DirListing()
         var moves: [PlannedMove] = []
         for e in entries {
             let original = originalOf[e.url.path]
             let dir = original == nil ? e.dir : dupDir
             if e.url.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL { continue }
-            let dest = uniqueDestination(dir: dir, name: e.url.lastPathComponent, used: &used)
+            let dest = uniqueDestination(dir: dir, name: e.url.lastPathComponent, used: &used, listing: listing)
             moves.append(PlannedMove(source: e.url, dest: dest, duplicateOf: original))
         }
         return moves.sorted { $0.dest.path.localizedStandardCompare($1.dest.path) == .orderedAscending }
     }
 
-    static func uniqueDestination(dir: URL, name: String, used: inout Set<String>) -> URL {
+    /// Nomi già presenti nelle cartelle di destinazione, letti una volta per cartella invece di un `fileExists` per file
+    /// (su un NAS è una richiesta di rete ciascuno). Nomi confrontati senza maiuscole né accenti scomposti, per prudenza.
+    final class DirListing {
+        private var names: [String: Set<String>?] = [:]
+        private static func key(_ n: String) -> String { n.precomposedStringWithCanonicalMapping.lowercased() }
+
+        func contains(dir: URL, name: String) -> Bool {
+            let d = dir.path
+            if names[d] == nil {
+                if let list = try? FileManager.default.contentsOfDirectory(atPath: d) {
+                    names[d] = Set(list.map(Self.key))
+                } else if !FileManager.default.fileExists(atPath: d) {
+                    names[d] = Set<String>()
+                } else {
+                    names[d] = .some(nil)   // cartella non leggibile: si controlla file per file
+                }
+            }
+            if let set = names[d] ?? nil { return set.contains(Self.key(name)) }
+            return FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path)
+        }
+    }
+
+    static func uniqueDestination(dir: URL, name: String, used: inout Set<String>, listing: DirListing? = nil) -> URL {
         let fm = FileManager.default
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
         var candidate = dir.appendingPathComponent(name)
         var n = 1
-        while used.contains(candidate.path) || fm.fileExists(atPath: candidate.path) {
+        while used.contains(candidate.path)
+                || (listing?.contains(dir: dir, name: candidate.lastPathComponent) ?? fm.fileExists(atPath: candidate.path)) {
             let newName = ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)"
             candidate = dir.appendingPathComponent(newName)
             n += 1
@@ -409,12 +592,18 @@ enum Organizer {
 
     static func apply(_ moves: [PlannedMove], root: URL,
                       progress: ((_ done: Int, _ total: Int) -> Void)? = nil) -> (done: Int, failed: Int) {
+        FileChanges.didChange()
+        defer { FileChanges.didChange() }
         let fm = FileManager.default
         var pairs: [[String]] = []
         var failed = 0
+        var made = Set<String>()
         for (i, m) in moves.enumerated() {
             do {
-                try fm.createDirectory(at: m.dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let parent = m.dest.deletingLastPathComponent()
+                if made.insert(parent.path).inserted {
+                    try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+                }
                 try fm.moveItem(at: m.source, to: m.dest)
                 pairs.append([m.source.path, m.dest.path])
             } catch {
@@ -428,6 +617,8 @@ enum Organizer {
     }
 
     static func undo(_ log: UndoLog, progress: ((_ done: Int, _ total: Int) -> Void)? = nil) -> (restored: Int, failed: Int) {
+        FileChanges.didChange()
+        defer { FileChanges.didChange() }
         let fm = FileManager.default
         let root = URL(fileURLWithPath: log.root).standardizedFileURL
         var restored = 0, failed = 0
@@ -1248,7 +1439,8 @@ final class SearchModel: ObservableObject {
 
     var selectedHits: [Hit] { hits.filter { selection.contains($0.id) } }
 
-    func search() {
+    /// `refresh`: rilegge il disco anche se l'indice dell'ultima scansione è ancora buono.
+    func search(refresh: Bool = false) {
         let words = useName ? text.split(separator: " ").map(String.init).filter { !$0.isEmpty } : []
         guard canSearch else {
             status = "Scegli almeno un criterio: nome, data o tipo di file."
@@ -1265,13 +1457,50 @@ final class SearchModel: ObservableObject {
         announced = false
         scanned = 0
         status = "Ricerca in corso…"
-        searchDeep(words: words)
+        searchDeep(words: words, refresh: refresh)
     }
 
     /// Interrompe la ricerca in corso e tiene i risultati già trovati.
     func stop() { deepTask?.cancel() }
 
-    private func searchDeep(words: [String]) {
+    /// Un file letto dal disco, con tutto quello che serve per filtrarlo senza rileggerlo.
+    struct IndexedFile {
+        let url: URL
+        let size: Int64?
+        let created: Date?
+        let modified: Date?
+        let type: UTType?
+    }
+
+    /// Ultima scansione completa, tenuta in memoria: le ricerche successive negli stessi posti la filtrano
+    /// senza toccare il disco. Vale poco tempo e si butta quando i file cambiano.
+    struct ScanCache {
+        let key: String
+        let date: Date
+        let generation: Int
+        let files: [IndexedFile]
+    }
+    @Published private var cache: ScanCache?
+    nonisolated private static let cacheMaxFiles = 1_500_000
+    private static let cacheMaxAge: TimeInterval = 20 * 60
+    /// Quando è stata fatta la scansione da cui arrivano i risultati (nil = letti ora dal disco).
+    @Published var cachedAt: Date?
+
+    /// Posti e opzioni che cambiano il contenuto dell'indice.
+    private var cacheKey: String { (searchRoots.map(\.path).sorted() + [includeSystem ? "sys" : "nosys", searchComputer ? "mac" : "nomac"]).joined(separator: "|") }
+
+    /// L'indice in memoria è ancora buono per questa ricerca?
+    private var validCache: ScanCache? {
+        guard let c = cache, c.key == cacheKey, c.generation == FileChanges.generation, Date().timeIntervalSince(c.date) < Self.cacheMaxAge else { return nil }
+        return c
+    }
+
+    var hasCache: Bool { validCache != nil }
+
+    /// Butta l'indice: da usare quando i file sono cambiati (spostamenti, copie) o si vuole rileggere il disco.
+    func dropCache() { cache = nil; cachedAt = nil }
+
+    private func searchDeep(words: [String], refresh: Bool) {
         let roots = searchRoots
         let cal = Calendar.current
         let lo = cal.startOfDay(for: min(from, to))
@@ -1284,65 +1513,118 @@ final class SearchModel: ObservableObject {
         var skipTop: Set<String> = ["/Volumes", "/dev", "/cores", "/Network", "/System/Volumes"]
         if !includeSystem { skipTop.formUnion(["/System", "/private", "/usr", "/bin", "/sbin", "/opt", "/Library"]) }
         let skipTopLevel = skipTop
-        deepTask = Task.detached(priority: .userInitiated) { [weak self] in
-            var batch: [Hit] = []
-            var count = 0
-            var lastReport = Date()
-            let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
-                                          .creationDateKey, .contentTypeKey]
-            func flush(_ folder: String) async {
-                let out = batch, n = count
-                batch = []
-                lastReport = Date()
-                await MainActor.run { self?.deepProgress(out, scanned: n, folder: folder) }
+        let key = cacheKey
+        let generation = FileChanges.generation
+        let wanted = words
+
+        /// Il file corrisponde ai criteri? Lavora solo sui dati già letti.
+        @Sendable func evaluate(_ f: IndexedFile) -> Hit? {
+            guard wanted.allSatisfy({ f.url.lastPathComponent.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) != nil }) else { return nil }
+            var date = f.modified
+            if let d = dateRange {
+                date = d.created ? f.created : f.modified
+                guard let x = date, x >= d.lo, x < d.hi else { return nil }
             }
-            outer: for root in roots {
-                guard let en = FileManager.default.enumerator(
-                    at: root, includingPropertiesForKeys: keys,
-                    options: [.skipsHiddenFiles, .skipsPackageDescendants],
-                    errorHandler: { _, _ in true }) else { continue }
-                while let url = en.nextObject() as? URL {
-                    if Task.isCancelled { break outer }
-                    let v = try? url.resourceValues(forKeys: Set(keys))
-                    if v?.isDirectory == true {
-                        if (root.path == "/" && skipTopLevel.contains(url.path))
-                            || (skipLibrary && url.lastPathComponent == "Library") { en.skipDescendants() }
-                        continue
-                    }
-                    count += 1
-                    var date = v?.contentModificationDate
-                    if !words.allSatisfy({ url.lastPathComponent.range(of: $0, options: [.caseInsensitive, .diacriticInsensitive]) != nil }) {
-                        // Nome non corrispondente
-                    } else if let d = dateRange, !({
-                        date = d.created ? v?.creationDate : v?.contentModificationDate
-                        guard let x = date else { return false }
-                        return x >= d.lo && x < d.hi
-                    }()) {
-                        // Data fuori dal periodo
-                    } else if !types.isEmpty, !(v?.contentType.map { t in types.contains { t.conforms(to: $0) } } ?? false) {
-                        // Tipo diverso
-                    } else {
-                        batch.append(Hit(url: url, size: v?.fileSize.map(Int64.init), date: date))
-                    }
-                    if batch.count >= 200 || Date().timeIntervalSince(lastReport) > 0.4 {
-                        await flush(url.deletingLastPathComponent().lastPathComponent)
-                    }
+            if !types.isEmpty, !(f.type.map { t in types.contains { t.conforms(to: $0) } } ?? false) { return nil }
+            return Hit(url: f.url, size: f.size, date: date)
+        }
+
+        // Stessi posti di poco fa: si filtra l'indice in memoria, senza rileggere il disco.
+        if !refresh, let c = validCache {
+            cachedAt = c.date
+            deepTask = Task.detached(priority: .userInitiated) { [weak self] in
+                let model = self
+                var hits: [Hit] = []
+                for f in c.files {
+                    if Task.isCancelled { break }
+                    if let h = evaluate(f) { hits.append(h) }
+                }
+                let found = hits
+                await MainActor.run {
+                    model?.deepProgress(found, scanned: c.files.count, folder: "")
+                    model?.deepFinish(fromCache: c.date)
                 }
             }
-            await flush("")
-            await MainActor.run { self?.deepFinish() }
+            return
+        }
+        cachedAt = nil
+
+        deepTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .fileSizeKey, .contentModificationDateKey,
+                                          .creationDateKey, .contentTypeKey]
+            let keySet = Set(keys)
+            let model = self
+            let sink = SearchSink(keepIndex: true, limit: Self.cacheMaxFiles) { hits, n, folder in
+                DispatchQueue.main.async { MainActor.assumeIsolated { model?.deepProgress(hits, scanned: n, folder: folder) } }
+            }
+            let cancel = CancelFlag()
+
+            // Una coda di cartelle per ogni posto, con tanti thread quanti ne sopporta quel tipo di disco.
+            let queues = roots.map { DirQueue([$0]) }
+            let lanes = roots.map { Lanes.count(for: $0) }
+            let owner = lanes.enumerated().flatMap { i, n in Array(repeating: i, count: n) }
+
+            await withTaskCancellationHandler {
+                DispatchQueue.concurrentPerform(iterations: owner.count) { w in
+                    let qi = owner[w]
+                    let root = roots[qi], queue = queues[qi]
+                    while let dir = queue.next() {
+                        var subdirs: [URL] = []
+                        if !cancel.isSet {
+                            let items = (try? FileManager.default.contentsOfDirectory(
+                                at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
+                            var local: [IndexedFile] = []
+                            var hits: [Hit] = []
+                            for url in items {
+                                let v = try? url.resourceValues(forKeys: keySet)
+                                if v?.isDirectory == true {
+                                    if v?.isPackage == true { continue }
+                                    if (root.path == "/" && skipTopLevel.contains(url.path))
+                                        || (skipLibrary && url.lastPathComponent == "Library") { continue }
+                                    subdirs.append(url)
+                                    continue
+                                }
+                                let f = IndexedFile(url: url, size: v?.fileSize.map(Int64.init),
+                                                    created: v?.creationDate, modified: v?.contentModificationDate,
+                                                    type: v?.contentType)
+                                local.append(f)
+                                if let h = evaluate(f) { hits.append(h) }
+                            }
+                            sink.add(hits: hits, files: local, folder: dir.lastPathComponent)
+                        }
+                        queue.done(adding: cancel.isSet ? [] : subdirs)
+                    }
+                }
+            } onCancel: {
+                cancel.set(true)
+                queues.forEach { $0.abort() }
+            }
+
+            let (rest, n, index) = sink.finish()
+            let complete = !cancel.isSet
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self = model else { return }
+                    self.deepProgress(rest, scanned: n, folder: "")
+                    // Indice completo e non enorme: tenuto per le prossime ricerche.
+                    if complete, let index {
+                        self.cache = ScanCache(key: key, date: Date(), generation: generation, files: index)
+                    }
+                    self.deepFinish(fromCache: nil)
+                }
+            }
         }
     }
 
     private func deepProgress(_ hits: [Hit], scanned n: Int, folder: String) {
         guard searching else { return }
         all.append(contentsOf: hits.prefix(max(Self.maxHits - all.count, 0)))
-        scanned = n
+        scanned = max(scanned, n)
         if !self.hits.isEmpty { announceResults() }
         status = "Ricerca approfondita: \(n) file controllati, \(all.count) trovati" + (folder.isEmpty ? "" : " · ora in “\(folder)”")
     }
 
-    private func deepFinish() {
+    private func deepFinish(fromCache date: Date?) {
         guard searching else { return }
         var seen = Set<String>()
         all = all.filter { seen.insert($0.id).inserted }
@@ -1351,6 +1633,11 @@ final class SearchModel: ObservableObject {
         searching = false
         let n = hits.count
         status = n == 0 ? "Nessun file trovato (controllati \(scanned))." : "\(n) file trovati su \(scanned) controllati."
+        if let date {
+            let ago = RelativeDateTimeFormatter()
+            ago.unitsStyle = .full
+            status += " Dall'ultima scansione, \(ago.localizedString(for: date, relativeTo: Date())): usa “Rileggi il disco” per aggiornare."
+        }
         announceResults()
     }
 
@@ -1446,6 +1733,8 @@ final class SearchModel: ObservableObject {
             }
         }
         Task.detached {
+            FileChanges.didChange()
+            defer { FileChanges.didChange() }
             let fm = FileManager.default
             var used = Set<String>()
             var done: [(from: URL, to: URL)] = []
@@ -1487,6 +1776,8 @@ final class SearchModel: ObservableObject {
             }
         }
         Task.detached {
+            FileChanges.didChange()
+            defer { FileChanges.didChange() }
             let fm = FileManager.default
             var restored: [Hit] = []
             var failed = 0
@@ -1939,6 +2230,12 @@ struct SearchView: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(!enabled)
                 Spacer(minLength: 8)
+                if m.hasCache && !m.searching {
+                    Button { m.search(refresh: true) } label: { Label("Rileggi il disco", systemImage: "arrow.clockwise") }
+                        .buttonStyle(.borderless).font(.caption)
+                        .help("Le ricerche ripetute usano l'ultima scansione, già in memoria. Questo la rifà dal disco.")
+                        .disabled(!enabled)
+                }
                 Button { m.clear() } label: { Label("Pulisci tutto", systemImage: "xmark.circle") }
                     .buttonStyle(.borderless).font(.caption)
                     .disabled(m.busy || (m.text.isEmpty && !m.useDate && !m.useKind && m.all.isEmpty && !m.searching))
@@ -4176,6 +4473,7 @@ final class DuplicateFinder: ObservableObject {
             case .exact:
                 let byPath = Dictionary(files.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
                 let found = Duplicates.groups(files.map { ($0.url, $0.size) },
+                                              lanes: Lanes.count(for: root),
                                               isCancelled: { cancelled.isSet },
                                               progress: throttled { d, t in
                     Task { @MainActor in
@@ -4289,6 +4587,8 @@ final class DuplicateFinder: ObservableObject {
             }
         }
         Task.detached {
+            FileChanges.didChange()
+            defer { FileChanges.didChange() }
             var gone = Set<String>()
             for (i, u) in chosen.enumerated() {
                 if (try? FileManager.default.trashItem(at: u, resultingItemURL: nil)) != nil { gone.insert(u.path) }
