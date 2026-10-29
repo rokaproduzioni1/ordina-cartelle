@@ -9,6 +9,6 @@ V=$(cat VERSION)
 ZIP="Genuzzu-$V.zip"
 rm -f "$ZIP"
 ditto -c -k --keepParent Genuzzu.app "$ZIP"
-gh release create "v$V" "$ZIP" --title "Genuzzu $V" --notes "${1:-Versione $V}"
+gh release create "v$V" "$ZIP" "Genuzzu.dmg" --title "Genuzzu $V" --notes "${1:-Versione $V}"
 rm -f "$ZIP"
 echo "Release v$V pubblicata."

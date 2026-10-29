@@ -34,3 +34,11 @@ PLIST
 # e chiede il consenso alle cartelle una volta sola.
 codesign --force --sign - -r='designated => identifier "local.genuzzu"' "$APP"
 echo "Creata: $PWD/$APP"
+
+# DMG con collegamento ad Applicazioni
+STAGE="build-dmg"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"
+hdiutil create -volname "Genuzzu" -srcfolder "$STAGE" -ov -format UDZO "Genuzzu.dmg" >/dev/null
+rm -rf "$STAGE"
+echo "Creato: $PWD/Genuzzu.dmg"

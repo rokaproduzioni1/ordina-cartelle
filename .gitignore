@@ -2,3 +2,5 @@ Genuzzu.app/
 *.zip
 .DS_Store
 *-Installer.zip
+Genuzzu.dmg
+build-dmg/
