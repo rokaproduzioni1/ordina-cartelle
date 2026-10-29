@@ -161,7 +161,124 @@ enum FileChanges {
     private static let lock = NSLock()
     private static var count = 0
     static var generation: Int { lock.lock(); defer { lock.unlock() }; return count }
-    static func didChange() { lock.lock(); count += 1; lock.unlock() }
+    static func didChange() {
+        lock.lock(); count += 1; lock.unlock()
+        IndexStore.remove()   // anche l'indice salvato su disco non vale più
+    }
+}
+
+// MARK: - Indice della ricerca su disco
+
+/// Salva l'ultima scansione in un file compatto, così alla riapertura dell'app la prima ricerca è già veloce.
+/// Contiene l'elenco dei file (percorso, dimensione, date, tipo) dei posti scansionati: resta nella cartella dell'app.
+enum IndexStore {
+    private static let lock = NSLock()
+    private static let magic: [UInt8] = Array("GZI1".utf8)
+
+    static var url: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("OrdinaCartelle")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("indice-ricerca.bin")
+    }
+
+    static func remove() {
+        lock.lock(); defer { lock.unlock() }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// Scrive l'indice solo se nel frattempo l'app non ha modificato file (`generation` è quella di inizio scansione).
+    static func save(key: String, date: Date, generation: Int, files: [SearchModel.IndexedFile]) {
+        var types: [String] = []
+        var typeIndex: [String: UInt16] = [:]
+        var d = Data()
+        d.reserveCapacity(files.count * 80)
+        func u8(_ v: UInt8) { d.append(v) }
+        func u16(_ v: UInt16) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+        func u32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+        func u64(_ v: UInt64) { var x = v.littleEndian; withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+        func str(_ s: String) { let b = Array(s.utf8); u32(UInt32(b.count)); d.append(contentsOf: b) }
+
+        for f in files {
+            str(f.url.path)
+            var flags: UInt8 = 0
+            if f.size != nil { flags |= 1 }
+            if f.created != nil { flags |= 2 }
+            if f.modified != nil { flags |= 4 }
+            var t: UInt16 = 0
+            if let id = f.type?.identifier {
+                if let i = typeIndex[id] { t = i + 1 }
+                else if types.count < Int(UInt16.max) - 1 { types.append(id); typeIndex[id] = UInt16(types.count - 1); t = UInt16(types.count) }
+            }
+            if t != 0 { flags |= 8 }
+            u8(flags)
+            if let s = f.size { u64(UInt64(bitPattern: s)) }
+            if let c = f.created { u64(c.timeIntervalSinceReferenceDate.bitPattern) }
+            if let m = f.modified { u64(m.timeIntervalSinceReferenceDate.bitPattern) }
+            if t != 0 { u16(t) }
+        }
+        let body = d
+        d = Data(magic)
+        str(key)
+        u64(date.timeIntervalSinceReferenceDate.bitPattern)
+        u32(UInt32(types.count))
+        for t in types { str(t) }
+        u64(UInt64(files.count))
+        d.append(body)
+
+        lock.lock(); defer { lock.unlock() }
+        guard generation == FileChanges.generation else { return }
+        try? d.write(to: url, options: .atomic)
+    }
+
+    /// L'indice salvato, se c'è, è leggibile e non più vecchio di `maxAge`.
+    static func load(maxAge: TimeInterval) -> (key: String, date: Date, files: [SearchModel.IndexedFile])? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        let b = [UInt8](data)
+        var o = 0
+        var bad = false
+        func take(_ n: Int) -> Range<Int>? {
+            guard !bad, n >= 0, o + n <= b.count else { bad = true; return nil }
+            defer { o += n }
+            return o..<(o + n)
+        }
+        func u8() -> UInt8 { take(1).map { b[$0.lowerBound] } ?? 0 }
+        func int(_ n: Int) -> UInt64 {
+            guard let r = take(n) else { return 0 }
+            var v: UInt64 = 0
+            for (i, x) in b[r].enumerated() { v |= UInt64(x) << (8 * UInt64(i)) }
+            return v
+        }
+        func str() -> String {
+            let n = Int(int(4))
+            guard let r = take(n) else { return "" }
+            return String(decoding: b[r], as: UTF8.self)
+        }
+        guard take(4).map({ Array(b[$0]) }) == magic else { return nil }
+        let key = str()
+        let date = Date(timeIntervalSinceReferenceDate: Double(bitPattern: int(8)))
+        guard Date().timeIntervalSince(date) < maxAge else { return nil }
+        let typeCount = Int(int(4))
+        var types: [UTType?] = []
+        for _ in 0..<min(typeCount, 70_000) { types.append(UTType(str())) }
+        let count = Int(int(8))
+        guard !bad, count >= 0, count <= b.count else { return nil }
+        var files: [SearchModel.IndexedFile] = []
+        files.reserveCapacity(count)
+        for _ in 0..<count {
+            let path = str()
+            let flags = u8()
+            let size: Int64? = flags & 1 != 0 ? Int64(bitPattern: int(8)) : nil
+            let created: Date? = flags & 2 != 0 ? Date(timeIntervalSinceReferenceDate: Double(bitPattern: int(8))) : nil
+            let modified: Date? = flags & 4 != 0 ? Date(timeIntervalSinceReferenceDate: Double(bitPattern: int(8))) : nil
+            var type: UTType?
+            if flags & 8 != 0 { let t = Int(int(2)); if t >= 1, t <= types.count { type = types[t - 1] } }
+            if bad { return nil }
+            files.append(SearchModel.IndexedFile(url: URL(fileURLWithPath: path, isDirectory: false),
+                                                 size: size, created: created, modified: modified, type: type))
+        }
+        return (key, date, files)
+    }
 }
 
 // MARK: - Parallelismo
@@ -1374,6 +1491,7 @@ final class SearchModel: ObservableObject {
 
     init() {
         refreshVolumes()
+        loadStoredIndex()
         for n in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
             NSWorkspace.shared.notificationCenter.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in self?.refreshVolumes() }
@@ -1482,7 +1600,7 @@ final class SearchModel: ObservableObject {
     }
     @Published private var cache: ScanCache?
     nonisolated private static let cacheMaxFiles = 1_500_000
-    private static let cacheMaxAge: TimeInterval = 20 * 60
+    nonisolated private static let cacheMaxAge: TimeInterval = 6 * 3600
     /// Quando è stata fatta la scansione da cui arrivano i risultati (nil = letti ora dal disco).
     @Published var cachedAt: Date?
 
@@ -1498,7 +1616,20 @@ final class SearchModel: ObservableObject {
     var hasCache: Bool { validCache != nil }
 
     /// Butta l'indice: da usare quando i file sono cambiati (spostamenti, copie) o si vuole rileggere il disco.
-    func dropCache() { cache = nil; cachedAt = nil }
+    func dropCache() { cache = nil; cachedAt = nil; IndexStore.remove() }
+
+    /// Rimette in memoria l'indice salvato nell'ultima sessione (letto in background: può essere grande).
+    private func loadStoredIndex() {
+        let generation = FileChanges.generation
+        Task.detached(priority: .utility) { [weak self] in
+            guard let stored = IndexStore.load(maxAge: Self.cacheMaxAge) else { return }
+            let model = self
+            await MainActor.run {
+                guard let model, model.cache == nil else { return }
+                model.cache = ScanCache(key: stored.key, date: stored.date, generation: generation, files: stored.files)
+            }
+        }
+    }
 
     private func searchDeep(words: [String], refresh: Bool) {
         let roots = searchRoots
@@ -1608,7 +1739,11 @@ final class SearchModel: ObservableObject {
                     self.deepProgress(rest, scanned: n, folder: "")
                     // Indice completo e non enorme: tenuto per le prossime ricerche.
                     if complete, let index {
-                        self.cache = ScanCache(key: key, date: Date(), generation: generation, files: index)
+                        let now = Date()
+                        self.cache = ScanCache(key: key, date: now, generation: generation, files: index)
+                        Task.detached(priority: .utility) {
+                            IndexStore.save(key: key, date: now, generation: generation, files: index)
+                        }
                     }
                     self.deepFinish(fromCache: nil)
                 }
