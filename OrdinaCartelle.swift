@@ -1370,6 +1370,30 @@ enum FileKind: String, CaseIterable, Identifiable {
     }
     /// Tipi di contenuto che corrispondono a questa categoria.
     var utTypes: [UTType] { types.compactMap { UTType($0) } }
+
+    /// macOS considera video tutti i ".ts" e ".mts", ma sono anche le estensioni dei sorgenti TypeScript.
+    private static let ambiguousVideoTypes: Set<String> = ["public.mpeg-2-transport-stream", "public.avchd-mpeg-2-transport-stream"]
+
+    /// Il tipo dice "video" solo per via dell'estensione, ma il file è in realtà codice?
+    /// Legge il disco solo per i file di quelle due estensioni abbastanza grandi da poter essere video.
+    static func isFakeVideo(_ type: UTType, url: URL, size: Int64?) -> Bool {
+        guard ambiguousVideoTypes.contains(type.identifier) else { return false }
+        if let size, size < 64 * 1024 { return true }
+        // Se il file non si può leggere (disco scollegato) resta valido il tipo indicato dal sistema.
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 1024) else { return false }
+        return !hasTransportStreamPackets(Array(data))
+    }
+
+    /// Un flusso MPEG è fatto di pacchetti a lunghezza fissa che iniziano tutti con il byte 0x47:
+    /// da 188 byte (.ts), da 192 con 4 byte di orario in testa (.mts delle videocamere), da 204 con correzione d'errore.
+    private static func hasTransportStreamPackets(_ bytes: [UInt8]) -> Bool {
+        [(start: 0, packet: 188), (start: 4, packet: 192), (start: 0, packet: 204)].contains { layout in
+            let offsets = (0..<3).map { layout.start + $0 * layout.packet }
+            return offsets.allSatisfy { $0 < bytes.count && bytes[$0] == 0x47 }
+        }
+    }
 }
 
 /// Icona di un file nei risultati: miniatura vera per le immagini, icona di sistema per gli altri.
@@ -1638,6 +1662,7 @@ final class SearchModel: ObservableObject {
         let hi = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: max(from, to))) ?? max(from, to)
         let dateRange = useDate ? (created: dateField == .created, lo: lo, hi: hi) : nil
         let types = useKind ? kind.utTypes : []
+        let wantsVideo = useKind && kind == .video
         let skipLibrary = !includeSystem && searchComputer
         let includeSystem = self.includeSystem
         // Dalla radice del Mac: i dischi collegati si leggono a parte e /System/Volumes duplicherebbe tutto.
@@ -1657,6 +1682,7 @@ final class SearchModel: ObservableObject {
                 guard let x = date, x >= d.lo, x < d.hi else { return nil }
             }
             if !types.isEmpty, !(f.type.map { t in types.contains { t.conforms(to: $0) } } ?? false) { return nil }
+            if wantsVideo, let t = f.type, FileKind.isFakeVideo(t, url: f.url, size: f.size) { return nil }
             return Hit(url: f.url, size: f.size, date: date)
         }
 
